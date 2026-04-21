@@ -5,6 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/consumer/ .
+COPY src/bridge/ .
 
-CMD ["python", "consumer.py"]
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "bridge.py"]
