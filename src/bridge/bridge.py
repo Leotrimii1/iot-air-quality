@@ -7,11 +7,11 @@ import os
 # MQTT settings
 BROKER = os.getenv("MQTT_BROKER", "mqtt")
 PORT = int(os.getenv("MQTT_PORT", 1883))
-TOPIC = os.getenv("MQTT_TOPIC", "air_quality/sensor1")
+TOPIC = os.getenv("MQTT_TOPIC", "air-quality/sensor1")
 
 # Kafka settings
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "air_quality")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "air-quality")
 
 # Kafka Producer setup
 producer = None

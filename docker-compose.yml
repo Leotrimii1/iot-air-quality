@@ -72,8 +72,14 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=hadesarchitect-cassandra-datasource
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      cassandra:
+        condition: service_healthy
     networks:
       - iot_network
 
@@ -83,6 +89,10 @@ services:
       dockerfile: docker/simulator/Dockerfile
     environment:
       - PYTHONUNBUFFERED=1
+      - MQTT_BROKER=mqtt
+      - MQTT_TOPIC=air-quality/sensor1
+      - DATASET_PATH=/app/prishtina_pm1_pm2.5.csv
+      - SIMULATOR_SLEEP_SECONDS=1
     depends_on:
       - mqtt
     networks:
@@ -96,6 +106,8 @@ services:
       - PYTHONUNBUFFERED=1
       - KAFKA_BROKER=kafka:9092
       - MQTT_BROKER=mqtt
+      - MQTT_TOPIC=air-quality/sensor1
+      - KAFKA_TOPIC=air-quality
     depends_on:
       - mqtt
       - kafka
@@ -109,7 +121,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - KAFKA_BROKER=kafka:9092
+      - KAFKA_TOPIC=air-quality
       - CASSANDRA_HOST=cassandra
+      - CASSANDRA_KEYSPACE=air_quality
+      - CASSANDRA_TABLE=air_quality
     depends_on:
       cassandra:
         condition: service_healthy

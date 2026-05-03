@@ -1,0 +1,17 @@
+apiVersion: 1
+
+deleteDatasources:
+  - name: Cassandra Air Quality
+    orgId: 1
+
+datasources:
+  - name: Cassandra Air Quality
+    uid: cassandra_air_quality
+    type: hadesarchitect-cassandra-datasource
+    access: proxy
+    url: cassandra:9042
+    isDefault: true
+    editable: true
+    jsonData:
+      keyspace: air_quality
+      consistency: ONE
