@@ -205,7 +205,7 @@
           "queryType": "query",
           "rawQuery": true,
           "refId": "A",
-          "target": "SELECT sensor_id, pm25, timestamp FROM air_quality.air_quality WHERE sensor_id = 'airgradient_prishtina_001' AND timestamp >= $__timeFrom AND timestamp <= $__timeTo"
+          "target": "SELECT sensor_id, pm2_5, timestamp FROM air_quality.air_quality WHERE sensor_id = 'airgradient_prishtina_001' AND timestamp >= $__timeFrom AND timestamp <= $__timeTo"
         }
       ],
       "title": "PM2.5 Time Series",
@@ -263,7 +263,7 @@
           "calcs": [
             "lastNotNull"
           ],
-          "fields": "/pm25/",
+          "fields": "/pm2_5/",
           "values": false
         },
         "showPercentChange": false,
@@ -276,7 +276,7 @@
           "queryType": "query",
           "rawQuery": true,
           "refId": "A",
-          "target": "SELECT sensor_id, pm25, timestamp FROM air_quality.air_quality WHERE sensor_id = 'airgradient_prishtina_001' AND timestamp >= $__timeFrom AND timestamp <= $__timeTo ORDER BY timestamp DESC LIMIT 1"
+          "target": "SELECT sensor_id, pm2_5, timestamp FROM air_quality.air_quality WHERE sensor_id = 'airgradient_prishtina_001' AND timestamp >= $__timeFrom AND timestamp <= $__timeTo ORDER BY timestamp DESC LIMIT 1"
         }
       ],
       "title": "Latest PM2.5",
@@ -417,7 +417,7 @@
           "calcs": [
             "lastNotNull"
           ],
-          "fields": "/pm1|pm25/",
+          "fields": "/pm1|pm2_5/",
           "values": false
         },
         "showPercentChange": false,
@@ -430,7 +430,7 @@
           "queryType": "query",
           "rawQuery": true,
           "refId": "A",
-          "target": "SELECT sensor_id, pm1, pm25, timestamp FROM air_quality.air_quality WHERE sensor_id = 'airgradient_prishtina_001' AND timestamp >= $__timeFrom AND timestamp <= $__timeTo ORDER BY timestamp DESC LIMIT 1"
+          "target": "SELECT sensor_id, pm1, pm2_5, timestamp FROM air_quality.air_quality WHERE sensor_id = 'airgradient_prishtina_001' AND timestamp >= $__timeFrom AND timestamp <= $__timeTo ORDER BY timestamp DESC LIMIT 1"
         }
       ],
       "title": "Latest Values",

@@ -1,4 +1,4 @@
-location_id,timestamp,pm1,pm25,unit,relativehumidity,temperature,um003,sensor_id,latitude,longitude,location
+location_id,timestamp,pm1,pm2.5,unit,relativehumidity,temperature,um003,sensor_id,latitude,longitude,location
 6232996,2026-02-08 08:00:00+00:00,21.304125,33.74333312,µg/m³,69.29320841,9.25908341,2927.002083,airgradient_prishtina_001,42.670917,21.151694,"Prishtina, Kosovo"
 6232996,2026-02-08 09:00:00+00:00,20.93299999,32.68099982,µg/m³,69.51283315,9.73533322,2935.1,airgradient_prishtina_001,42.670917,21.151694,"Prishtina, Kosovo"
 6232996,2026-02-08 10:00:00+00:00,18.54674999,28.00620831,µg/m³,66.10358313,11.0474167,2682.65,airgradient_prishtina_001,42.670917,21.151694,"Prishtina, Kosovo"

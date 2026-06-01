@@ -34,13 +34,23 @@ def init_cassandra():
                     sensor_id text,
                     timestamp timestamp,
                     pm1 float,
-                    pm25 float,
+                    pm2_5 float,
                     status text,
                     location text,
                     PRIMARY KEY (sensor_id, timestamp)
                 ) WITH CLUSTERING ORDER BY (timestamp DESC)
                 """
             )
+
+            try:
+                session.execute(
+                    f"""
+                    ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
+                    ADD pm2_5 float
+                    """
+                )
+            except Exception:
+                pass
 
             print(
                 f"Cassandra schema initialized: "
@@ -67,7 +77,7 @@ schema = StructType(
     [
         StructField("timestamp", StringType(), False),
         StructField("pm1", DoubleType(), False),
-        StructField("pm25", DoubleType(), False),
+        StructField("pm2.5", DoubleType(), False),
         StructField("sensor_id", StringType(), True),
         StructField("location", StringType(), True),
         StructField("latitude", DoubleType(), True),
@@ -90,9 +100,10 @@ parsed_df = (
     .filter(
         col("timestamp").isNotNull()
         & col("pm1").isNotNull()
-        & col("pm25").isNotNull()
+        & col("`pm2.5`").isNotNull()
     )
     .withColumn("timestamp", to_timestamp(col("timestamp")))
+    .withColumn("pm2_5", col("`pm2.5`"))
     .withColumn(
         "sensor_id",
         when(col("sensor_id").isNull(), lit("airgradient_prishtina_001")).otherwise(
@@ -107,12 +118,12 @@ parsed_df = (
     )
     .withColumn(
         "status",
-        when(col("pm25") <= 15, lit("Good"))
-        .when(col("pm25") <= 35, lit("Moderate"))
-        .when(col("pm25") <= 55, lit("Unhealthy"))
+        when(col("pm2_5") <= 15, lit("Good"))
+        .when(col("pm2_5") <= 35, lit("Moderate"))
+        .when(col("pm2_5") <= 55, lit("Unhealthy"))
         .otherwise(lit("Very Unhealthy")),
     )
-    .select("sensor_id", "timestamp", "pm1", "pm25", "status", "location")
+    .select("sensor_id", "timestamp", "pm1", "pm2_5", "status", "location")
 )
 
 query = (

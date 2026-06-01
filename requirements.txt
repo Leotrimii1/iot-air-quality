@@ -1,4 +1,5 @@
 paho-mqtt==1.6.1
+Flask==3.0.3
 cassandra-driver==3.25.0
 kafka-python==2.0.2
 pyspark==3.5.0

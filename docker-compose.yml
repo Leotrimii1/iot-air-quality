@@ -87,12 +87,15 @@ services:
     build:
       context: .
       dockerfile: docker/simulator/Dockerfile
+    ports:
+      - "5000:5000"
     environment:
       - PYTHONUNBUFFERED=1
       - MQTT_BROKER=mqtt
       - MQTT_TOPIC=air-quality/sensor1
-      - DATASET_PATH=/app/prishtina_pm1_pm2.5.csv
-      - SIMULATOR_SLEEP_SECONDS=1
+      - SIMULATOR_UI_PORT=5000
+      - SIMULATOR_SENSOR_COUNT=3
+      - SIMULATOR_INTERVAL_MS=1000
     depends_on:
       - mqtt
     networks:
