@@ -40,9 +40,13 @@ def on_message(client, userdata, msg):
         print(f"Received from MQTT: {data}")
         
         if producer:
-            producer.send(KAFKA_TOPIC, value=data)
+            future = producer.send(KAFKA_TOPIC, value=data)
+            metadata = future.get(timeout=10)
             producer.flush()
-            print(f"Sent to Kafka topic '{KAFKA_TOPIC}'")
+            print(
+                f"Kafka accepted message: topic={metadata.topic}, "
+                f"partition={metadata.partition}, offset={metadata.offset}"
+            )
     except Exception as e:
         print(f"Error bridging message: {e}")
 

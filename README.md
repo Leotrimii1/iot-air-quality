@@ -14,7 +14,7 @@
 Ky projekt implementon nje pipeline IoT per monitorimin e cilesise se ajrit duke perdorur nje simulator GUI qe gjeneron te dhena sintetike ne kohe reale.
 
 ```text
-Simulator -> MQTT/Mosquitto -> Kafka -> Spark -> Cassandra -> Grafana
+Simulator + Dashboard GUI -> MQTT/Mosquitto -> Kafka -> Spark -> Cassandra -> Grafana
 ```
 
 Simulatori perfaqeson sensore optike te tipit AirGradient dhe transmeton matje PM1 dhe PM2.5 ne MQTT. Numri i sensoreve dhe frekuenca e dergimit kontrollohen nga GUI-ja e simulatorit.
@@ -27,10 +27,11 @@ Simulatori perfaqeson sensore optike te tipit AirGradient dhe transmeton matje P
 - Live Data shfaq vlerat e fundit per sensoret aktiv.
 - Simulatori gjeneron PM1/PM2.5 vazhdimisht, pa lexuar nga CSV/Excel.
 - P.sh. 1000 sensore cdo 100ms prodhojne rreth 10,000 matje/sec.
-- Bridge MQTT-to-Kafka i dergon mesazhet ne topic Kafka `air-quality`.
-- Spark Structured Streaming lexon mesazhet nga Kafka dhe llogarit statusin e cilesise se ajrit.
-- Cassandra ruan te dhenat e procesuara ne skemen e kerkuar.
-- Grafana konfigurohet automatikisht me datasource per Cassandra dhe dashboard te gatshem.
+- Bridge MQTT-to-Kafka i dergon mesazhet ne topic Kafka `air-quality` dhe log-on offset-in kur Kafka i pranon.
+- Spark Structured Streaming lexon mesazhet nga Kafka dhe llogarit statusin e cilesise se ajrit ne kohe reale.
+- Cassandra ruan vetem matjet e nevojshme ne tabelen kryesore, ndersa metadata e sensoreve ruhet vecmas.
+- Dashboard-i custom ne GUI lexon rezultatet nga Cassandra dhe shfaq grafe live.
+- Grafana eshte e integruar brenda GUI-se si dashboard embedded.
 
 ## Formati i te Dhenave
 
@@ -38,17 +39,29 @@ Simulatori publikon mesazhe JSON te ketij tipi:
 
 ```json
 {
+  "message_id": "4f5dd6c5-2b9f-468e-a9a2-806b7efcdbad",
   "timestamp": "2026-06-01T17:30:00.000000+00:00",
-  "pm1": 13.742,
-  "pm2.5": 22.511,
-  "sensor_id": "airgradient_prishtina_001",
-  "location": "Prishtina, Kosovo",
-  "latitude": 42.670917,
-  "longitude": 21.151694,
-  "relativehumidity": 58.2,
-  "temperature": 18.7,
-  "um003": 3376.65,
-  "unit": "ug/m3"
+  "sensor": {
+    "id": "airgradient_prishtina_001",
+    "type": "AirGradient PM Simulator",
+    "firmware": "sim-1.0",
+    "location": "Prishtina, Kosovo",
+    "latitude": 42.670917,
+    "longitude": 21.151694,
+    "unit": "ug/m3"
+  },
+  "measurements": {
+    "pm1": 13.742,
+    "pm2.5": 22.511,
+    "relative_humidity": 58.2,
+    "temperature": 18.7,
+    "um003": 3376.65
+  },
+  "health": {
+    "battery": 96.3,
+    "signal": -51,
+    "status": "online"
+  }
 }
 ```
 
@@ -63,27 +76,53 @@ PM2.5 <= 55  -> Unhealthy
 PM2.5 > 55   -> Very Unhealthy
 ```
 
-Klasifikimi nuk ruhet ne CSV. Ai llogaritet ne `src/processor/processor.py` dhe pastaj ruhet ne Cassandra.
+Klasifikimi nuk ruhet ne CSV dhe nuk vjen i gatshem nga sensori. Procesori krijon/lexon tabelen `quality_ranks` kur starton Spark Streaming, pastaj perdor ato metadata per te llogaritur statusin nga PM2.5.
 
 ## Skema e Cassandra
 
-Procesori e krijon automatikisht kete tabele:
+Procesori krijon automatikisht keto tabela:
 
 ```sql
 CREATE TABLE air_quality.air_quality (
     sensor_id text,
     timestamp timestamp,
-    pm1 float,
-    pm2_5 float,
+    pm1 double,
+    pm2_5 double,
     status text,
     location text,
     PRIMARY KEY (sensor_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
+
+CREATE TABLE air_quality.sensor_metadata (
+    sensor_id text PRIMARY KEY,
+    sensor_type text,
+    firmware text,
+    location text,
+    latitude double,
+    longitude double,
+    unit text,
+    updated_at timestamp
+);
+
+CREATE TABLE air_quality.quality_ranks (
+    pollutant text,
+    rank_order int,
+    rank_name text,
+    max_value double,
+    PRIMARY KEY (pollutant, rank_order)
+) WITH CLUSTERING ORDER BY (rank_order ASC);
 ```
 
-## Dashboard ne Grafana
+Tabela `air_quality` ruan matjet kryesore dhe lokacionin per query te shpejta. Metadata me e plote e sensorit ruhet ne `sensor_metadata`, ndersa pragjet e klasifikimit ruhen ne `quality_ranks`.
 
-Grafana konfigurohet automatikisht nga fajllat ne `docker/grafana`.
+## Dashboard dhe Grafana
+
+GUI-ja ne `http://localhost:5000` perfshin dashboard-in e vizualizimit. Te dhenat lexohen nga Cassandra, pra grafet shfaqin rezultatin pas perpunimit me Spark Streaming.
+
+Ne tab-in `Dashboard` ka dy shtresa vizualizimi:
+
+- Dashboard custom me karta, graf PM1/PM2.5 dhe tabela te sensoreve.
+- Grafana Analytics e integruar brenda GUI-se me iframe.
 
 Panelet e perfshira:
 
@@ -91,7 +130,8 @@ Panelet e perfshira:
 - Grafiku kohor per PM2.5
 - Paneli i statusit te cilesise se ajrit
 - Paneli me vlerat me te fundit
-- Vizualizim me ngjyra sipas pragjeve te PM2.5
+- Tabela e metadata-s se sensoreve
+- Grafana dashboard i integruar nga `http://localhost:3000`
 
 ## Ekzekutimi
 
@@ -115,14 +155,6 @@ Sherbimet hapen ketu:
 - Spark master UI: http://localhost:8080
 - MQTT: `localhost:1883`
 - Cassandra: `localhost:9042`
-
-
-Dashboard-i gjendet ketu:
-
-```text
-Dashboards -> Air Quality -> Prishtina Air Quality
-```
-![Grafana Dashboard](image.png)
 
 
 ## Perdorimi i Simulatorit
@@ -158,6 +190,9 @@ Sensor 2 -> 19.8
 Sensor 3 -> 25.1
 ```
 
+Per grafe dhe rezultate hap tab-in `Dashboard` brenda te njejtes GUI.
+Pjesa `Grafana Analytics` shfaq dashboard-in e Grafana-s brenda GUI-se. Nese deshiron ta hapesh vecmas, perdor `http://localhost:3000`.
+
 ## Verifikimi
 
 Gjendja dhe matjet live shihen ne Simulator GUI. Per debug mund te kontrollohen edhe log-et:
@@ -172,16 +207,40 @@ Bridge-in MQTT-to-Kafka:
 docker compose logs -f bridge
 ```
 
+Kur Kafka e pranon mesazhin, ne log duhet te shfaqet dicka si:
+
+```text
+Kafka accepted message: topic=air-quality, partition=0, offset=123
+```
+
 Procesimin ne Spark:
 
 ```powershell
 docker compose logs -f processor
 ```
 
+Grafana:
+
+```powershell
+docker compose logs -f grafana
+```
+
 Kontrollimi i te dhenat ne Cassandra:
 
 ```powershell
-docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.air_quality LIMIT 10;"
+docker compose exec cassandra cqlsh -e "SELECT sensor_id, timestamp, pm1, pm2_5, status, location FROM air_quality.air_quality LIMIT 10;"
+```
+
+Kontrollimi i metadata-s se sensoreve:
+
+```powershell
+docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.sensor_metadata LIMIT 10;"
+```
+
+Kontrollimi i pragjeve te PM2.5:
+
+```powershell
+docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.quality_ranks;"
 ```
 
 Kontrollimi nese Kafka topic ekziston:

@@ -5,9 +5,11 @@ import os
 import random
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
+from cassandra.cluster import Cluster
 from flask import Flask, jsonify, render_template_string, request
 
 
@@ -18,6 +20,10 @@ UI_PORT = int(os.getenv("SIMULATOR_UI_PORT", "5000"))
 DEFAULT_SENSOR_COUNT = int(os.getenv("SIMULATOR_SENSOR_COUNT", "3"))
 DEFAULT_INTERVAL_MS = int(os.getenv("SIMULATOR_INTERVAL_MS", "1000"))
 MAX_LIVE_READINGS = int(os.getenv("SIMULATOR_MAX_LIVE_READINGS", "60"))
+CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "cassandra")
+CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "air_quality")
+CASSANDRA_TABLE = os.getenv("CASSANDRA_TABLE", "air_quality")
+SENSOR_METADATA_TABLE = os.getenv("SENSOR_METADATA_TABLE", "sensor_metadata")
 
 LOCATION = os.getenv("SIMULATOR_LOCATION", "Prishtina, Kosovo")
 BASE_LATITUDE = float(os.getenv("SIMULATOR_LATITUDE", "42.670917"))
@@ -28,6 +34,9 @@ app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 state_lock = threading.Lock()
+cassandra_lock = threading.Lock()
+cassandra_cluster = None
+cassandra_session = None
 stop_event = threading.Event()
 publisher_thread = None
 simulator_state = {
@@ -368,8 +377,130 @@ INDEX_HTML = """
       overflow-wrap: anywhere;
     }
 
+    .tabbar {
+      display: inline-grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 18px;
+      padding: 5px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: 0 8px 22px rgba(37, 99, 235, 0.07);
+    }
+
+    .tab-button {
+      min-width: 132px;
+      height: 36px;
+      background: transparent;
+      color: var(--muted);
+      border-color: transparent;
+    }
+
+    .tab-button.active {
+      background: var(--accent);
+      color: #ffffff;
+    }
+
+    .view {
+      display: none;
+    }
+
+    .view.active {
+      display: block;
+    }
+
+    .dashboard-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.55fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .chart-wrap {
+      height: 360px;
+      width: 100%;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .sensor-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .sensor-table th,
+    .sensor-table td {
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .sensor-table th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+
+    .table-scroll {
+      max-height: 360px;
+      overflow: auto;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      color: var(--accent-dark);
+      font-weight: 720;
+    }
+
+    .grafana-panel {
+      margin-top: 18px;
+      padding: 0;
+      overflow: hidden;
+    }
+
+    .grafana-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .grafana-frame {
+      width: 100%;
+      height: 620px;
+      display: block;
+      border: 0;
+      background: #ffffff;
+    }
+
+    .external-link {
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-weight: 720;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
     @media (max-width: 900px) {
       .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .dashboard-layout {
         grid-template-columns: 1fr;
       }
 
@@ -401,6 +532,10 @@ INDEX_HTML = """
         align-items: flex-start;
         flex-direction: column;
       }
+
+      .grafana-frame {
+        height: 520px;
+      }
     }
   </style>
 </head>
@@ -417,6 +552,12 @@ INDEX_HTML = """
       </div>
     </header>
 
+    <div class="tabbar">
+      <button id="simulatorTab" class="tab-button active" type="button">Simulator</button>
+      <button id="dashboardTab" class="tab-button" type="button">Dashboard</button>
+    </div>
+
+    <div id="simulatorView" class="view active">
     <div class="metrics">
       <div class="metric">
         <p class="metric-label">Sensore</p>
@@ -478,6 +619,78 @@ INDEX_HTML = """
         <div id="emptyState" class="empty">Nuk ka matje aktive.</div>
       </section>
     </div>
+    </div>
+
+    <div id="dashboardView" class="view">
+      <div class="metrics">
+        <div class="metric">
+          <p class="metric-label">Sensore aktive</p>
+          <p id="dbActiveSensors" class="metric-value">0</p>
+          <p class="metric-note">nga metadata</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">PM2.5 i fundit</p>
+          <p id="dbLatestPm25" class="metric-value">0.0</p>
+          <p class="metric-note">ug/m3</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Statusi</p>
+          <p id="dbStatus" class="metric-value">-</p>
+          <p class="metric-note">nga Spark</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Lokacioni</p>
+          <p id="dbLocation" class="metric-value">-</p>
+          <p class="metric-note">nga Cassandra</p>
+        </div>
+      </div>
+
+      <div class="dashboard-layout">
+        <section class="panel">
+          <div class="live-header">
+            <h2 class="panel-title">PM1 / PM2.5</h2>
+            <span id="chartSensor" class="live-count">airgradient_prishtina_001</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="pmChart"></canvas>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="live-header">
+            <h2 class="panel-title">Sensoret</h2>
+            <span id="sensorTableCount" class="live-count">0</span>
+          </div>
+          <div class="table-scroll">
+            <table class="sensor-table">
+              <thead>
+                <tr>
+                  <th>Sensor</th>
+                  <th>Lokacion</th>
+                  <th>Njesia</th>
+                </tr>
+              </thead>
+              <tbody id="sensorTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel grafana-panel">
+        <div class="grafana-header">
+          <div>
+            <h2 class="panel-title">Grafana Analytics</h2>
+            <span class="live-count">Dashboard i integruar nga Grafana</span>
+          </div>
+          <a class="external-link" href="http://localhost:3000/d/prishtina-air-quality/prishtina-air-quality?orgId=1&from=now-30m&to=now&theme=light" target="_blank" rel="noreferrer">Hap ne Grafana</a>
+        </div>
+        <iframe
+          class="grafana-frame"
+          src="http://localhost:3000/d/prishtina-air-quality/prishtina-air-quality?orgId=1&from=now-30m&to=now&theme=light&kiosk"
+          title="Grafana Air Quality Dashboard"
+        ></iframe>
+      </section>
+    </div>
   </main>
 
   <script>
@@ -489,6 +702,12 @@ INDEX_HTML = """
     const errorBox = document.getElementById("errorBox");
     const liveGrid = document.getElementById("liveGrid");
     const emptyState = document.getElementById("emptyState");
+    const simulatorTab = document.getElementById("simulatorTab");
+    const dashboardTab = document.getElementById("dashboardTab");
+    const simulatorView = document.getElementById("simulatorView");
+    const dashboardView = document.getElementById("dashboardView");
+    const pmChart = document.getElementById("pmChart");
+    let activeDashboardSensor = "airgradient_prishtina_001";
 
     function numberValue(input, fallback) {
       const parsed = Number.parseInt(input.value, 10);
@@ -504,6 +723,32 @@ INDEX_HTML = """
 
     function formatNumber(value) {
       return new Intl.NumberFormat("en-US").format(Math.round(value));
+    }
+
+    function formatDecimal(value) {
+      if (!Number.isFinite(Number(value))) {
+        return "-";
+      }
+      return Number(value).toFixed(1);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function setView(viewName) {
+      const dashboardActive = viewName === "dashboard";
+      simulatorTab.classList.toggle("active", !dashboardActive);
+      dashboardTab.classList.toggle("active", dashboardActive);
+      simulatorView.classList.toggle("active", !dashboardActive);
+      dashboardView.classList.toggle("active", dashboardActive);
+      if (dashboardActive) {
+        refreshDashboard().catch((error) => showError(error.message));
+      }
     }
 
     function showError(message) {
@@ -603,9 +848,134 @@ INDEX_HTML = """
       showError(data.last_error || "");
     }
 
+    function renderSensors(sensors) {
+      const body = document.getElementById("sensorTableBody");
+      body.innerHTML = "";
+      document.getElementById("sensorTableCount").textContent = `${sensors.length}`;
+      sensors.slice(0, 80).forEach((sensor) => {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td>${escapeHtml(sensor.sensor_id)}</td>
+          <td>${escapeHtml(sensor.location || "-")}</td>
+          <td>${escapeHtml(sensor.unit || "ug/m3")}</td>
+        `;
+        row.addEventListener("click", () => {
+          activeDashboardSensor = sensor.sensor_id;
+          refreshDashboard().catch((error) => showError(error.message));
+        });
+        body.appendChild(row);
+      });
+    }
+
+    function drawLine(ctx, points, key, color, bounds, padding) {
+      if (!points.length) {
+        return;
+      }
+
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const value = Number(point[key]);
+        const x = padding.left + (index / Math.max(points.length - 1, 1)) * bounds.width;
+        const ratio = (value - bounds.min) / Math.max(bounds.max - bounds.min, 1);
+        const y = padding.top + bounds.height - (ratio * bounds.height);
+        if (index === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.stroke();
+    }
+
+    function drawChart(points) {
+      const rect = pmChart.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      pmChart.width = Math.max(1, Math.floor(rect.width * ratio));
+      pmChart.height = Math.max(1, Math.floor(rect.height * ratio));
+
+      const ctx = pmChart.getContext("2d");
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, rect.width, rect.height);
+
+      const padding = { top: 18, right: 18, bottom: 28, left: 44 };
+      const width = rect.width - padding.left - padding.right;
+      const height = rect.height - padding.top - padding.bottom;
+
+      ctx.fillStyle = "#f8fbff";
+      ctx.fillRect(0, 0, rect.width, rect.height);
+      ctx.strokeStyle = "#d7e3f5";
+      ctx.lineWidth = 1;
+
+      for (let i = 0; i <= 4; i += 1) {
+        const y = padding.top + (height / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y);
+        ctx.lineTo(padding.left + width, y);
+        ctx.stroke();
+      }
+
+      if (!points.length) {
+        ctx.fillStyle = "#64748b";
+        ctx.font = "14px system-ui";
+        ctx.fillText("Nuk ka ende te dhena nga Cassandra", padding.left, padding.top + 28);
+        return;
+      }
+
+      const values = points.flatMap((point) => [Number(point.pm1), Number(point.pm2_5)]);
+      const maxValue = Math.max(...values, 35);
+      const minValue = Math.min(...values, 0);
+      const bounds = {
+        min: Math.max(0, Math.floor(minValue - 5)),
+        max: Math.ceil(maxValue + 5),
+        width,
+        height,
+      };
+
+      ctx.fillStyle = "#64748b";
+      ctx.font = "12px system-ui";
+      ctx.fillText(`${bounds.max}`, 8, padding.top + 4);
+      ctx.fillText(`${bounds.min}`, 8, padding.top + height);
+
+      drawLine(ctx, points, "pm1", "#38bdf8", bounds, padding);
+      drawLine(ctx, points, "pm2_5", "#2563eb", bounds, padding);
+
+      ctx.fillStyle = "#38bdf8";
+      ctx.fillRect(padding.left, rect.height - 18, 12, 4);
+      ctx.fillStyle = "#132238";
+      ctx.fillText("PM1", padding.left + 18, rect.height - 14);
+      ctx.fillStyle = "#2563eb";
+      ctx.fillRect(padding.left + 70, rect.height - 18, 12, 4);
+      ctx.fillStyle = "#132238";
+      ctx.fillText("PM2.5", padding.left + 88, rect.height - 14);
+    }
+
+    function renderDashboard(data) {
+      const latest = data.latest;
+      showError(data.error || "");
+      document.getElementById("dbActiveSensors").textContent = formatNumber(data.sensors.length);
+      document.getElementById("dbLatestPm25").textContent = latest ? formatDecimal(latest.pm2_5) : "-";
+      document.getElementById("dbStatus").textContent = latest ? latest.status : "-";
+      document.getElementById("dbLocation").textContent = latest ? latest.location : "-";
+      document.getElementById("chartSensor").textContent = data.sensor_id;
+      renderSensors(data.sensors);
+      drawChart(data.timeseries);
+    }
+
     async function refreshStatus() {
       const response = await fetch("/api/status");
       renderStatus(await response.json());
+    }
+
+    async function refreshDashboard() {
+      const response = await fetch(`/api/dashboard?sensor_id=${encodeURIComponent(activeDashboardSensor)}`);
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      renderDashboard(await response.json());
     }
 
     document.getElementById("startButton").addEventListener("click", () => {
@@ -620,9 +990,21 @@ INDEX_HTML = """
     sensorCount.addEventListener("input", () => {
       configSensorCount.value = sensorCount.value;
     });
+    simulatorTab.addEventListener("click", () => setView("simulator"));
+    dashboardTab.addEventListener("click", () => setView("dashboard"));
+    window.addEventListener("resize", () => {
+      if (dashboardView.classList.contains("active")) {
+        refreshDashboard().catch((error) => showError(error.message));
+      }
+    });
 
     refreshStatus().catch((error) => showError(error.message));
     setInterval(() => refreshStatus().catch((error) => showError(error.message)), 600);
+    setInterval(() => {
+      if (dashboardView.classList.contains("active")) {
+        refreshDashboard().catch((error) => showError(error.message));
+      }
+    }, 2500);
   </script>
 </body>
 </html>
@@ -675,18 +1057,35 @@ def generate_reading(sensor_number, now_epoch):
     temperature = 12 + (math.sin((day_fraction * math.tau) - 0.5) * 7)
     humidity = 58 - (math.sin((day_fraction * math.tau) - 0.5) * 16)
 
+    sensor_identifier = sensor_id(sensor_number)
+
     return {
+        "message_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "pm1": round(pm1, 3),
-        "pm2.5": round(pm2_5, 3),
-        "sensor_id": sensor_id(sensor_number),
-        "location": LOCATION,
-        "latitude": round(BASE_LATITUDE + ((sensor_number % 17) - 8) * 0.00025, 6),
-        "longitude": round(BASE_LONGITUDE + ((sensor_number % 19) - 9) * 0.00025, 6),
-        "relativehumidity": round(bounded(humidity + random.gauss(0, 2.2), 15, 95), 2),
-        "temperature": round(temperature + random.gauss(0, 0.7), 2),
-        "um003": round(pm2_5 * random.uniform(120, 180), 2),
-        "unit": "ug/m3",
+        "sensor": {
+            "id": sensor_identifier,
+            "type": "AirGradient PM Simulator",
+            "firmware": "sim-1.0",
+            "location": LOCATION,
+            "latitude": round(BASE_LATITUDE + ((sensor_number % 17) - 8) * 0.00025, 6),
+            "longitude": round(BASE_LONGITUDE + ((sensor_number % 19) - 9) * 0.00025, 6),
+            "unit": "ug/m3",
+        },
+        "measurements": {
+            "pm1": round(pm1, 3),
+            "pm2.5": round(pm2_5, 3),
+            "relative_humidity": round(
+                bounded(humidity + random.gauss(0, 2.2), 15, 95),
+                2,
+            ),
+            "temperature": round(temperature + random.gauss(0, 0.7), 2),
+            "um003": round(pm2_5 * random.uniform(120, 180), 2),
+        },
+        "health": {
+            "battery": round(random.uniform(82, 100), 1),
+            "signal": random.randint(-72, -38),
+            "status": "online",
+        },
     }
 
 
@@ -762,9 +1161,9 @@ def publish_loop(worker_stop_event):
                     live_readings.append(
                         {
                             "sensor_number": sensor_number,
-                            "sensor_id": reading["sensor_id"],
-                            "pm1": reading["pm1"],
-                            "pm2_5": reading["pm2.5"],
+                            "sensor_id": reading["sensor"]["id"],
+                            "pm1": reading["measurements"]["pm1"],
+                            "pm2_5": reading["measurements"]["pm2.5"],
                             "timestamp": reading["timestamp"],
                         }
                     )
@@ -800,6 +1199,81 @@ def status_snapshot():
     return snapshot
 
 
+def row_timestamp(value):
+    return value.isoformat() if value is not None else None
+
+
+def get_cassandra_session():
+    global cassandra_cluster
+    global cassandra_session
+
+    with cassandra_lock:
+        if cassandra_session is None:
+            cassandra_cluster = Cluster([CASSANDRA_HOST])
+            cassandra_session = cassandra_cluster.connect()
+        return cassandra_session
+
+
+def execute_cassandra(query, params=None):
+    global cassandra_cluster
+    global cassandra_session
+
+    try:
+        return get_cassandra_session().execute(query, params or [])
+    except Exception:
+        with cassandra_lock:
+            if cassandra_cluster is not None:
+                cassandra_cluster.shutdown()
+            cassandra_cluster = None
+            cassandra_session = None
+        raise
+
+
+def get_sensor_metadata():
+    rows = execute_cassandra(
+        f"""
+        SELECT sensor_id, location, unit, updated_at
+        FROM {CASSANDRA_KEYSPACE}.{SENSOR_METADATA_TABLE}
+        LIMIT 200
+        """
+    )
+    sensors = [
+        {
+            "sensor_id": row.sensor_id,
+            "location": row.location,
+            "unit": row.unit,
+            "updated_at": row_timestamp(row.updated_at),
+        }
+        for row in rows
+    ]
+    return sorted(sensors, key=lambda item: item["sensor_id"])
+
+
+def get_sensor_timeseries(sensor_id, limit=80):
+    safe_limit = max(1, min(int(limit), 200))
+    rows = execute_cassandra(
+        f"""
+        SELECT sensor_id, timestamp, pm1, pm2_5, status, location
+        FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
+        WHERE sensor_id = %s
+        LIMIT {safe_limit}
+        """,
+        (sensor_id,),
+    )
+    readings = [
+        {
+            "sensor_id": row.sensor_id,
+            "timestamp": row_timestamp(row.timestamp),
+            "pm1": row.pm1,
+            "pm2_5": row.pm2_5,
+            "status": row.status,
+            "location": row.location,
+        }
+        for row in rows
+    ]
+    return list(reversed(readings))
+
+
 @app.get("/")
 def index():
     return render_template_string(INDEX_HTML)
@@ -808,6 +1282,38 @@ def index():
 @app.get("/api/status")
 def api_status():
     return jsonify(status_snapshot())
+
+
+@app.get("/api/dashboard")
+def api_dashboard():
+    requested_sensor_id = request.args.get("sensor_id") or "airgradient_prishtina_001"
+    try:
+        sensors = get_sensor_metadata()
+        sensor_id = requested_sensor_id
+        if sensors and not any(sensor["sensor_id"] == sensor_id for sensor in sensors):
+            sensor_id = sensors[0]["sensor_id"]
+
+        timeseries = get_sensor_timeseries(sensor_id)
+        latest = timeseries[-1] if timeseries else None
+        return jsonify(
+            {
+                "sensor_id": sensor_id,
+                "sensors": sensors,
+                "timeseries": timeseries,
+                "latest": latest,
+                "error": None,
+            }
+        )
+    except Exception as exc:
+        return jsonify(
+            {
+                "sensor_id": requested_sensor_id,
+                "sensors": [],
+                "timeseries": [],
+                "latest": None,
+                "error": f"Cassandra dashboard data unavailable: {exc}",
+            }
+        )
 
 
 @app.post("/api/config")

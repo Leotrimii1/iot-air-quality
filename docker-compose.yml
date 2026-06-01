@@ -72,6 +72,10 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_USERS_DEFAULT_THEME=light
       - GF_INSTALL_PLUGINS=hadesarchitect-cassandra-datasource
     volumes:
       - grafana_data:/var/lib/grafana
@@ -96,6 +100,10 @@ services:
       - SIMULATOR_UI_PORT=5000
       - SIMULATOR_SENSOR_COUNT=3
       - SIMULATOR_INTERVAL_MS=1000
+      - CASSANDRA_HOST=cassandra
+      - CASSANDRA_KEYSPACE=air_quality
+      - CASSANDRA_TABLE=air_quality
+      - SENSOR_METADATA_TABLE=sensor_metadata
     depends_on:
       - mqtt
     networks:
@@ -142,8 +150,8 @@ volumes:
   mosquitto_data:
   mosquitto_log:
   cassandra_data:
-  grafana_data:
   kafka_data:
+  grafana_data:
 
 networks:
   iot_network:
