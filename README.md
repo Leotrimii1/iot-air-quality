@@ -21,7 +21,7 @@ Simulatori perfaqeson sensore optike te tipit AirGradient dhe transmeton matje P
 
 ## Cfare Eshte Implementuar
 
-- GUI per simulatorin ne `http://localhost:5000`.
+- GUI per simulatorin ne `http://localhost:5001`.
 - Paneli i Sensoreve me numrin e sensoreve, Start dhe Stop.
 - Konfigurimi i numrit te sensoreve dhe frekuences se dergimit ne milisekonda.
 - Live Data shfaq vlerat e fundit per sensoret aktiv.
@@ -32,6 +32,10 @@ Simulatori perfaqeson sensore optike te tipit AirGradient dhe transmeton matje P
 - Cassandra ruan vetem matjet e nevojshme ne tabelen kryesore, ndersa metadata e sensoreve ruhet vecmas.
 - Dashboard-i custom ne GUI lexon rezultatet nga Cassandra dhe shfaq grafe live.
 - Grafana eshte e integruar brenda GUI-se si dashboard embedded.
+- Compose krijon automatikisht topic-un Kafka `air-quality` perpara se te niset procesori.
+- Alarmet ngrihen ne Spark kur PM2.5 kalon pragjet e klasifikimit dhe ruhen si evente ne Cassandra.
+- Email alerts dergohen ne Mailpit qe mund t'i shikosh ne `http://localhost:8025`.
+- SMS alerts mbeshteten opsionalisht me Twilio kur vendosen variablat perkates.
 
 ## Formati i te Dhenave
 
@@ -115,9 +119,35 @@ CREATE TABLE air_quality.quality_ranks (
 
 Tabela `air_quality` ruan matjet kryesore dhe lokacionin per query te shpejta. Metadata me e plote e sensorit ruhet ne `sensor_metadata`, ndersa pragjet e klasifikimit ruhen ne `quality_ranks`.
 
+Procesori krijon edhe keto tabela per alarmet:
+
+```sql
+CREATE TABLE air_quality.alarm_state (
+    sensor_id text PRIMARY KEY,
+    last_status text,
+    last_email_sent_at timestamp,
+    last_sms_sent_at timestamp,
+    updated_at timestamp
+);
+
+CREATE TABLE air_quality.alarm_events (
+    sensor_id text,
+    event_time timestamp,
+    notification_channel text,
+    event_type text,
+    status text,
+    pm2_5 double,
+    location text,
+    message text,
+    PRIMARY KEY ((sensor_id), event_time, notification_channel)
+) WITH CLUSTERING ORDER BY (event_time DESC, notification_channel ASC);
+```
+
+Email alerts dergohen kur statusi kalon pragun `ALERT_EMAIL_MIN_STATUS` dhe shmangen duplicate me cooldown. Recovery email mund te dergohet kur statusi kthehet ne `Good`. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
+
 ## Dashboard dhe Grafana
 
-GUI-ja ne `http://localhost:5000` perfshin dashboard-in e vizualizimit. Te dhenat lexohen nga Cassandra, pra grafet shfaqin rezultatin pas perpunimit me Spark Streaming.
+GUI-ja ne `http://localhost:5001` perfshin dashboard-in e vizualizimit. Te dhenat lexohen nga Cassandra, pra grafet shfaqin rezultatin pas perpunimit me Spark Streaming.
 
 Ne tab-in `Dashboard` ka dy shtresa vizualizimi:
 
@@ -150,8 +180,9 @@ docker compose up --build
 
 Sherbimet hapen ketu:
 
-- Simulator GUI: http://localhost:5000
+- Simulator GUI: http://localhost:5001
 - Grafana: http://localhost:3000
+- Mailpit: http://localhost:8025
 - Spark master UI: http://localhost:8080
 - MQTT: `localhost:1883`
 - Cassandra: `localhost:9042`
@@ -162,7 +193,7 @@ Sherbimet hapen ketu:
 Hap GUI-ne:
 
 ```text
-http://localhost:5000
+http://localhost:5001
 ```
 
 Nga aty cakto:
@@ -225,6 +256,12 @@ Grafana:
 docker compose logs -f grafana
 ```
 
+Mailpit:
+
+```powershell
+docker compose logs -f mailpit
+```
+
 Kontrollimi i te dhenat ne Cassandra:
 
 ```powershell
@@ -241,6 +278,12 @@ Kontrollimi i pragjeve te PM2.5:
 
 ```powershell
 docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.quality_ranks;"
+```
+
+Kontrollimi i eventeve te alarmit:
+
+```powershell
+docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.alarm_events LIMIT 10;"
 ```
 
 Kontrollimi nese Kafka topic ekziston:

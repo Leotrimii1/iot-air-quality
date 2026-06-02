@@ -1,11 +1,19 @@
+import atexit
+import logging
 import os
 import time
+from typing import Dict, Optional
 
 from cassandra.cluster import Cluster
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, lit, to_timestamp, when
 from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
 
+from alerts import AlarmNotifier
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOGGER = logging.getLogger("air-quality.processor")
 
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "air-quality")
@@ -14,6 +22,8 @@ CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "air_quality")
 CASSANDRA_TABLE = os.getenv("CASSANDRA_TABLE", "air_quality")
 SENSOR_METADATA_TABLE = os.getenv("SENSOR_METADATA_TABLE", "sensor_metadata")
 QUALITY_RANKS_TABLE = os.getenv("QUALITY_RANKS_TABLE", "quality_ranks")
+ALARM_STATE_TABLE = os.getenv("ALARM_STATE_TABLE", "alarm_state")
+ALARM_EVENTS_TABLE = os.getenv("ALARM_EVENTS_TABLE", "alarm_events")
 
 DEFAULT_PM2_5_RANKS = {
     "Good": 15.0,
@@ -22,7 +32,30 @@ DEFAULT_PM2_5_RANKS = {
 }
 
 
-def init_cassandra():
+class CassandraContext:
+    def __init__(self, cluster: Cluster, session, quality_ranks: Dict[str, float]):
+        self.cluster = cluster
+        self.session = session
+        self.quality_ranks = quality_ranks
+
+
+cassandra_context: Optional[CassandraContext] = None
+
+
+def shutdown_cassandra():
+    global cassandra_context
+    if cassandra_context is not None:
+        try:
+            cassandra_context.cluster.shutdown()
+        except Exception as exc:
+            LOGGER.warning("Failed to shut down Cassandra cleanly: %s", exc)
+        cassandra_context = None
+
+
+atexit.register(shutdown_cassandra)
+
+
+def init_cassandra() -> CassandraContext:
     print("Waiting for Cassandra and initializing schema...")
     while True:
         try:
@@ -87,6 +120,34 @@ def init_cassandra():
                 """
             )
 
+            session.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {CASSANDRA_KEYSPACE}.{ALARM_STATE_TABLE} (
+                    sensor_id text PRIMARY KEY,
+                    last_status text,
+                    last_email_sent_at timestamp,
+                    last_sms_sent_at timestamp,
+                    updated_at timestamp
+                )
+                """
+            )
+
+            session.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {CASSANDRA_KEYSPACE}.{ALARM_EVENTS_TABLE} (
+                    sensor_id text,
+                    event_time timestamp,
+                    notification_channel text,
+                    event_type text,
+                    status text,
+                    pm2_5 double,
+                    location text,
+                    message text,
+                    PRIMARY KEY ((sensor_id), event_time, notification_channel)
+                ) WITH CLUSTERING ORDER BY (event_time DESC, notification_channel ASC)
+                """
+            )
+
             for rank_order, (rank_name, max_value) in enumerate(
                 DEFAULT_PM2_5_RANKS.items(),
                 start=1,
@@ -112,17 +173,20 @@ def init_cassandra():
 
             print(
                 f"Cassandra schema initialized. Tables: "
-                f"{CASSANDRA_TABLE}, {SENSOR_METADATA_TABLE}, {QUALITY_RANKS_TABLE}"
+                f"{CASSANDRA_TABLE}, {SENSOR_METADATA_TABLE}, {QUALITY_RANKS_TABLE}, "
+                f"{ALARM_STATE_TABLE}, {ALARM_EVENTS_TABLE}"
             )
             print(f"Loaded PM2.5 quality ranks: {quality_ranks}")
-            cluster.shutdown()
-            return quality_ranks
+            return CassandraContext(cluster, session, quality_ranks)
         except Exception as exc:
             print(f"Failed to connect to Cassandra: {exc}. Retrying in 5 seconds...")
             time.sleep(5)
 
 
-quality_ranks = init_cassandra()
+cassandra_context = init_cassandra()
+session = cassandra_context.session
+quality_ranks = cassandra_context.quality_ranks
+
 GOOD_MAX = float(quality_ranks["Good"])
 MODERATE_MAX = float(quality_ranks["Moderate"])
 UNHEALTHY_MAX = float(quality_ranks["Unhealthy"])
@@ -226,6 +290,36 @@ sensor_metadata_df = structured_df.select(
     col("timestamp").alias("updated_at"),
 )
 
+notifier = AlarmNotifier(session=session, keyspace=CASSANDRA_KEYSPACE, logger=LOGGER)
+
+
+def process_alarm_batch(batch_df, batch_id: int) -> None:
+    rows = (
+        batch_df.select("sensor_id", "timestamp", "pm2_5", "status", "location")
+        .collect()
+    )
+    if not rows:
+        return
+
+    LOGGER.info("Evaluating %s alarm candidates in batch %s", len(rows), batch_id)
+    for row in rows:
+        try:
+            notifier.handle_measurement(
+                sensor_id=row["sensor_id"],
+                timestamp=row["timestamp"],
+                pm2_5=row["pm2_5"],
+                status=row["status"],
+                location=row["location"],
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to process alert for sensor %s in batch %s: %s",
+                row["sensor_id"],
+                batch_id,
+                exc,
+            )
+
+
 measurements_query = (
     measurements_df.writeStream.format("org.apache.spark.sql.cassandra")
     .option("keyspace", CASSANDRA_KEYSPACE)
@@ -244,9 +338,21 @@ metadata_query = (
     .start()
 )
 
+alarms_query = (
+    measurements_df.writeStream.foreachBatch(process_alarm_batch)
+    .option("checkpointLocation", "/tmp/spark_checkpoint/air-quality-alarms")
+    .outputMode("append")
+    .start()
+)
+
 print(
     f"Streaming from Kafka topic '{KAFKA_TOPIC}' to Cassandra tables "
     f"'{CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}' and "
     f"'{CASSANDRA_KEYSPACE}.{SENSOR_METADATA_TABLE}'..."
 )
+print(
+    f"Alarm evaluation enabled with email threshold '{notifier.config.email_min_status}' "
+    f"and SMS threshold '{notifier.config.sms_min_status}'"
+)
+
 spark.streams.awaitAnyTermination()

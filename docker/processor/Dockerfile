@@ -4,9 +4,10 @@ USER root
 RUN pip install --no-cache-dir cassandra-driver
 
 WORKDIR /app
-COPY src/processor/processor.py .
+COPY src/processor/ /app/
 
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH="/app"
 ENV PATH="/opt/spark/bin:${PATH}"
 
 # Spark packages for Kafka and Cassandra
