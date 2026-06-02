@@ -24,6 +24,11 @@ CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "cassandra")
 CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "air_quality")
 CASSANDRA_TABLE = os.getenv("CASSANDRA_TABLE", "air_quality")
 SENSOR_METADATA_TABLE = os.getenv("SENSOR_METADATA_TABLE", "sensor_metadata")
+ANOMALY_PROFILE_TABLE = os.getenv("ANOMALY_PROFILE_TABLE", "sensor_ai_profiles")
+ANOMALY_EVENTS_TABLE = os.getenv("ANOMALY_EVENTS_TABLE", "anomaly_events")
+TRAINING_SAMPLE_TABLE = os.getenv("TRAINING_SAMPLE_TABLE", "sensor_ai_samples")
+MIN_TRAINING_SAMPLES = int(os.getenv("AI_MODEL_MIN_TRAINING_SAMPLES", "30"))
+MODEL_WINDOW_SIZE = int(os.getenv("AI_MODEL_WINDOW_SIZE", "200"))
 
 LOCATION = os.getenv("SIMULATOR_LOCATION", "Prishtina, Kosovo")
 BASE_LATITUDE = float(os.getenv("SIMULATOR_LATITUDE", "42.670917"))
@@ -291,6 +296,49 @@ INDEX_HTML = """
       font-size: 12px;
     }
 
+    .ai-status {
+      margin-top: 18px;
+    }
+
+    .ai-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .ai-card {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+      box-shadow: 0 8px 22px rgba(37, 99, 235, 0.07);
+    }
+
+    .ai-label {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 680;
+      text-transform: uppercase;
+    }
+
+    .ai-value {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.1;
+      font-weight: 760;
+      color: #1745a1;
+      overflow-wrap: anywhere;
+    }
+
+    .ai-subtext {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
     .live-header {
       display: flex;
       align-items: center;
@@ -464,6 +512,21 @@ INDEX_HTML = """
       font-weight: 720;
     }
 
+    .status-chip.good {
+      background: #e7f7ef;
+      color: #16784c;
+    }
+
+    .status-chip.warn {
+      background: #fff4df;
+      color: #b85b00;
+    }
+
+    .status-chip.bad {
+      background: #fff0f0;
+      color: #b8333a;
+    }
+
     .grafana-panel {
       margin-top: 18px;
       padding: 0;
@@ -507,6 +570,10 @@ INDEX_HTML = """
       .metrics {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
+
+      .ai-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
     }
 
     @media (max-width: 560px) {
@@ -525,6 +592,10 @@ INDEX_HTML = """
       }
 
       .metrics {
+        grid-template-columns: 1fr;
+      }
+
+      .ai-grid {
         grid-template-columns: 1fr;
       }
 
@@ -676,6 +747,35 @@ INDEX_HTML = """
         </section>
       </div>
 
+      <section class="panel ai-status">
+        <div class="live-header">
+          <h2 class="panel-title">AI Status</h2>
+          <span id="aiStatusBadge" class="status-chip">Warming up</span>
+        </div>
+        <div class="ai-grid">
+          <div class="ai-card">
+            <p class="ai-label">Model</p>
+            <p id="aiModelName" class="ai-value">Isolation Forest</p>
+            <p id="aiModelNote" class="ai-subtext">Real-time model per sensor</p>
+          </div>
+          <div class="ai-card">
+            <p class="ai-label">Training</p>
+            <p id="aiTrainingState" class="ai-value">0 / 30</p>
+            <p id="aiTrainingNote" class="ai-subtext">clean samples collected</p>
+          </div>
+          <div class="ai-card">
+            <p class="ai-label">Latest Score</p>
+            <p id="aiLatestScore" class="ai-value">-</p>
+            <p id="aiLatestReason" class="ai-subtext">No anomaly evaluated yet</p>
+          </div>
+          <div class="ai-card">
+            <p class="ai-label">Last Trained</p>
+            <p id="aiLastTrained" class="ai-value">-</p>
+            <p id="aiLastScored" class="ai-subtext">Not scored yet</p>
+          </div>
+        </div>
+      </section>
+
       <section class="panel grafana-panel">
         <div class="grafana-header">
           <div>
@@ -730,6 +830,17 @@ INDEX_HTML = """
         return "-";
       }
       return Number(value).toFixed(1);
+    }
+
+    function formatDateTime(value) {
+      if (!value) {
+        return "-";
+      }
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) {
+        return "-";
+      }
+      return date.toLocaleString();
     }
 
     function escapeHtml(value) {
@@ -955,6 +1066,7 @@ INDEX_HTML = """
 
     function renderDashboard(data) {
       const latest = data.latest;
+      const ai = data.ai_status || {};
       showError(data.error || "");
       document.getElementById("dbActiveSensors").textContent = formatNumber(data.sensors.length);
       document.getElementById("dbLatestPm25").textContent = latest ? formatDecimal(latest.pm2_5) : "-";
@@ -963,6 +1075,34 @@ INDEX_HTML = """
       document.getElementById("chartSensor").textContent = data.sensor_id;
       renderSensors(data.sensors);
       drawChart(data.timeseries);
+
+      const aiBadge = document.getElementById("aiStatusBadge");
+      aiBadge.className = "status-chip";
+      if (ai.status === "Anomaly detected") {
+        aiBadge.classList.add("bad");
+      } else if (ai.trained) {
+        aiBadge.classList.add("good");
+      } else {
+        aiBadge.classList.add("warn");
+      }
+      aiBadge.textContent = ai.status || "Warming up";
+      document.getElementById("aiModelName").textContent = ai.model_name || "Isolation Forest";
+      document.getElementById("aiModelNote").textContent = ai.trained ? "Model is trained and scoring live data" : "Model is still learning";
+      document.getElementById("aiTrainingState").textContent =
+        `${ai.trained_on_samples || 0} / ${ai.min_training_samples || 30}`;
+      document.getElementById("aiTrainingNote").textContent =
+        `${ai.clean_samples || 0} clean samples stored`;
+      document.getElementById("aiLatestScore").textContent =
+        ai.latest && Number.isFinite(Number(ai.latest.anomaly_score))
+          ? Number(ai.latest.anomaly_score).toFixed(4)
+          : "-";
+      document.getElementById("aiLatestReason").textContent =
+        (ai.latest && ai.latest.anomaly_reason) ||
+        (ai.latest_anomaly && ai.latest_anomaly.reason) ||
+        "No anomaly evaluated yet";
+      document.getElementById("aiLastTrained").textContent = formatDateTime(ai.last_trained_at);
+      document.getElementById("aiLastScored").textContent =
+        `Last scored: ${formatDateTime(ai.last_scored_at)}`;
     }
 
     async function refreshStatus() {
@@ -1253,7 +1393,7 @@ def get_sensor_timeseries(sensor_id, limit=80):
     safe_limit = max(1, min(int(limit), 200))
     rows = execute_cassandra(
         f"""
-        SELECT sensor_id, timestamp, pm1, pm2_5, status, location
+        SELECT sensor_id, timestamp, pm1, pm2_5, status, location, anomaly_score, is_anomaly, anomaly_reason
         FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
         WHERE sensor_id = %s
         LIMIT {safe_limit}
@@ -1268,10 +1408,113 @@ def get_sensor_timeseries(sensor_id, limit=80):
             "pm2_5": row.pm2_5,
             "status": row.status,
             "location": row.location,
+            "anomaly_score": row.anomaly_score,
+            "is_anomaly": row.is_anomaly,
+            "anomaly_reason": row.anomaly_reason,
         }
         for row in rows
     ]
     return list(reversed(readings))
+
+
+def get_ai_status(sensor_id):
+    profile_rows = execute_cassandra(
+        f"""
+        SELECT sensor_id, sample_count, trained_on_samples, last_trained_at, last_scored_at, updated_at
+        FROM {CASSANDRA_KEYSPACE}.{ANOMALY_PROFILE_TABLE}
+        WHERE sensor_id = %s
+        """,
+        (sensor_id,),
+    )
+    profile = profile_rows.one()
+
+    latest_row = execute_cassandra(
+        f"""
+        SELECT sensor_id, timestamp, pm1, pm2_5, status, location, anomaly_score, is_anomaly, anomaly_reason
+        FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
+        WHERE sensor_id = %s
+        LIMIT 1
+        """,
+        (sensor_id,),
+    ).one()
+
+    latest_anomaly = execute_cassandra(
+        f"""
+        SELECT sensor_id, event_time, anomaly_score, is_anomaly, reason, pm1, pm2_5, relative_humidity, temperature, status, location
+        FROM {CASSANDRA_KEYSPACE}.{ANOMALY_EVENTS_TABLE}
+        WHERE sensor_id = %s
+        LIMIT 1
+        """,
+        (sensor_id,),
+    ).one()
+
+    training_rows = execute_cassandra(
+        f"""
+        SELECT sensor_id, timestamp, pm1, pm2_5, relative_humidity, temperature
+        FROM {CASSANDRA_KEYSPACE}.{TRAINING_SAMPLE_TABLE}
+        WHERE sensor_id = %s
+        LIMIT {MODEL_WINDOW_SIZE}
+        """,
+        (sensor_id,),
+    )
+
+    clean_count = len(list(training_rows))
+    trained_on_samples = int(profile.trained_on_samples) if profile and profile.trained_on_samples is not None else 0
+    sample_count = int(profile.sample_count) if profile and profile.sample_count is not None else clean_count
+    trained = trained_on_samples >= MIN_TRAINING_SAMPLES
+
+    if profile and profile.last_trained_at:
+        last_trained_at = row_timestamp(profile.last_trained_at)
+    else:
+        last_trained_at = None
+
+    if profile and profile.last_scored_at:
+        last_scored_at = row_timestamp(profile.last_scored_at)
+    else:
+        last_scored_at = None
+
+    status = "Warming up"
+    if trained:
+        status = "Trained"
+    if latest_anomaly and latest_anomaly.is_anomaly:
+        status = "Anomaly detected"
+
+    latest = None
+    if latest_row is not None:
+        latest = {
+            "timestamp": row_timestamp(latest_row.timestamp),
+            "pm1": latest_row.pm1,
+            "pm2_5": latest_row.pm2_5,
+            "status": latest_row.status,
+            "location": latest_row.location,
+            "anomaly_score": latest_row.anomaly_score,
+            "is_anomaly": latest_row.is_anomaly,
+            "anomaly_reason": latest_row.anomaly_reason,
+        }
+
+    return {
+        "sensor_id": sensor_id,
+        "model_name": "Isolation Forest",
+        "status": status,
+        "trained": trained,
+        "clean_samples": clean_count,
+        "sample_count": sample_count,
+        "trained_on_samples": trained_on_samples,
+        "min_training_samples": MIN_TRAINING_SAMPLES,
+        "last_trained_at": last_trained_at,
+        "last_scored_at": last_scored_at,
+        "latest": latest,
+        "latest_anomaly": None
+        if latest_anomaly is None
+        else {
+            "event_time": row_timestamp(latest_anomaly.event_time),
+            "anomaly_score": latest_anomaly.anomaly_score,
+            "is_anomaly": latest_anomaly.is_anomaly,
+            "reason": latest_anomaly.reason,
+            "status": latest_anomaly.status,
+            "location": latest_anomaly.location,
+        },
+    }
 
 
 @app.get("/")
@@ -1295,12 +1538,14 @@ def api_dashboard():
 
         timeseries = get_sensor_timeseries(sensor_id)
         latest = timeseries[-1] if timeseries else None
+        ai_status = get_ai_status(sensor_id)
         return jsonify(
             {
                 "sensor_id": sensor_id,
                 "sensors": sensors,
                 "timeseries": timeseries,
                 "latest": latest,
+                "ai_status": ai_status,
                 "error": None,
             }
         )
@@ -1311,7 +1556,37 @@ def api_dashboard():
                 "sensors": [],
                 "timeseries": [],
                 "latest": None,
+                "ai_status": None,
                 "error": f"Cassandra dashboard data unavailable: {exc}",
+            }
+        )
+
+
+@app.get("/api/ai-status")
+def api_ai_status():
+    requested_sensor_id = request.args.get("sensor_id") or "airgradient_prishtina_001"
+    try:
+        sensors = get_sensor_metadata()
+        sensor_id = requested_sensor_id
+        if sensors and not any(sensor["sensor_id"] == sensor_id for sensor in sensors):
+            sensor_id = sensors[0]["sensor_id"]
+        return jsonify(get_ai_status(sensor_id))
+    except Exception as exc:
+        return jsonify(
+            {
+                "sensor_id": requested_sensor_id,
+                "model_name": "Isolation Forest",
+                "status": "Unavailable",
+                "trained": False,
+                "clean_samples": 0,
+                "sample_count": 0,
+                "trained_on_samples": 0,
+                "min_training_samples": MIN_TRAINING_SAMPLES,
+                "last_trained_at": None,
+                "last_scored_at": None,
+                "latest": None,
+                "latest_anomaly": None,
+                "error": f"AI status unavailable: {exc}",
             }
         )
 

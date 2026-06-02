@@ -1,7 +1,7 @@
 FROM apache/spark:3.5.1
 
 USER root
-RUN pip install --no-cache-dir cassandra-driver
+RUN pip install --no-cache-dir cassandra-driver scikit-learn
 
 WORKDIR /app
 COPY src/processor/ /app/

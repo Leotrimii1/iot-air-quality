@@ -29,11 +29,13 @@ Simulatori perfaqeson sensore optike te tipit AirGradient dhe transmeton matje P
 - P.sh. 1000 sensore cdo 100ms prodhojne rreth 10,000 matje/sec.
 - Bridge MQTT-to-Kafka i dergon mesazhet ne topic Kafka `air-quality` dhe log-on offset-in kur Kafka i pranon.
 - Spark Structured Streaming lexon mesazhet nga Kafka dhe llogarit statusin e cilesise se ajrit ne kohe reale.
-- Cassandra ruan vetem matjet e nevojshme ne tabelen kryesore, ndersa metadata e sensoreve ruhet vecmas.
+- Cassandra ruan matjet me rezultatet e AI-se te perfshira ne rresht, ndersa metadata e sensoreve ruhet vecmas.
 - Dashboard-i custom ne GUI lexon rezultatet nga Cassandra dhe shfaq grafe live.
 - Grafana eshte e integruar brenda GUI-se si dashboard embedded.
 - Compose krijon automatikisht topic-un Kafka `air-quality` perpara se te niset procesori.
 - Alarmet ngrihen ne Spark kur PM2.5 kalon pragjet e klasifikimit dhe ruhen si evente ne Cassandra.
+- Anomali AI zbulohen ne kohe reale me `Isolation Forest` perpara se rreshti te ruhet ne Cassandra.
+- Dashboard-i tani shfaq nje panel `AI Status` me gjendjen e modelit, numrin e mostrave te pastra dhe anomaline e fundit.
 - Email alerts dergohen ne Mailpit qe mund t'i shikosh ne `http://localhost:8025`.
 - SMS alerts mbeshteten opsionalisht me Twilio kur vendosen variablat perkates.
 
@@ -94,6 +96,9 @@ CREATE TABLE air_quality.air_quality (
     pm2_5 double,
     status text,
     location text,
+    anomaly_score double,
+    is_anomaly boolean,
+    anomaly_reason text,
     PRIMARY KEY (sensor_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 
@@ -141,7 +146,52 @@ CREATE TABLE air_quality.alarm_events (
     message text,
     PRIMARY KEY ((sensor_id), event_time, notification_channel)
 ) WITH CLUSTERING ORDER BY (event_time DESC, notification_channel ASC);
+
+CREATE TABLE air_quality.sensor_ai_profiles (
+    sensor_id text PRIMARY KEY,
+    sample_count int,
+    pm1_count int,
+    pm1_mean double,
+    pm1_m2 double,
+    pm2_5_count int,
+    pm2_5_mean double,
+    pm2_5_m2 double,
+    relative_humidity_count int,
+    relative_humidity_mean double,
+    relative_humidity_m2 double,
+    temperature_count int,
+    temperature_mean double,
+    temperature_m2 double,
+    updated_at timestamp
+);
+
+CREATE TABLE air_quality.anomaly_events (
+    sensor_id text,
+    event_time timestamp,
+    anomaly_score double,
+    is_anomaly boolean,
+    reason text,
+    pm1 double,
+    pm2_5 double,
+    relative_humidity double,
+    temperature double,
+    status text,
+    location text,
+    PRIMARY KEY ((sensor_id), event_time)
+) WITH CLUSTERING ORDER BY (event_time DESC);
+
+CREATE TABLE air_quality.sensor_ai_samples (
+    sensor_id text,
+    timestamp timestamp,
+    pm1 double,
+    pm2_5 double,
+    relative_humidity double,
+    temperature double,
+    PRIMARY KEY (sensor_id, timestamp)
+) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
+
+Rreshti kalon fillimisht ne motorin e zbulimit te anomalive, pastaj ruhet ne Cassandra bashke me `anomaly_score`, `is_anomaly` dhe `anomaly_reason`. `Isolation Forest` trajnohet ne kohe reale nga mostra te pastra qe ruhen ne `sensor_ai_samples`, ndersa metadata e trajnimit ruhet ne `sensor_ai_profiles`.
 
 Email alerts dergohen kur statusi kalon pragun `ALERT_EMAIL_MIN_STATUS` dhe shmangen duplicate me cooldown. Recovery email mund te dergohet kur statusi kthehet ne `Good`. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
 
