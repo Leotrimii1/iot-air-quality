@@ -53,9 +53,9 @@ class AlertConfig:
     smtp_username: str = os.getenv("ALERT_SMTP_USERNAME", "")
     smtp_password: str = os.getenv("ALERT_SMTP_PASSWORD", "")
     smtp_use_tls: bool = _env_bool("ALERT_SMTP_USE_TLS", False)
-    email_from: str = os.getenv("ALERT_EMAIL_FROM", "air-quality-alerts@example.com")
-    email_to: tuple[str, ...] = tuple(_env_list("ALERT_EMAIL_TO", "alerts@example.com"))
-    email_min_status: str = os.getenv("ALERT_EMAIL_MIN_STATUS", "Moderate")
+    email_from: str = os.getenv("ALERT_EMAIL_FROM", "alerts@airwatch-prishtina.com")
+    email_to: tuple[str, ...] = tuple(_env_list("ALERT_EMAIL_TO", "operations@airwatch-prishtina.com"))
+    email_min_status: str = os.getenv("ALERT_EMAIL_MIN_STATUS", "Unhealthy")
     sms_provider: str = os.getenv("ALERT_SMS_PROVIDER", "").strip().lower()
     sms_from: str = os.getenv("ALERT_SMS_FROM", "")
     sms_to: tuple[str, ...] = tuple(_env_list("ALERT_SMS_TO"))
@@ -140,7 +140,7 @@ class AlarmNotifier:
                 and previous.last_status is not None
                 and status_rank(previous.last_status) >= self.email_threshold
             ):
-                subject = f"Air quality recovered: {sensor_id}"
+                subject = f"AirWatch Prishtina recovery: {current_location}"
                 message = self._format_message(
                     sensor_id=sensor_id,
                     location=current_location,
@@ -149,17 +149,17 @@ class AlarmNotifier:
                     timestamp=now,
                     event_type="recovery",
                 )
-                self._send_email(subject, message)
-                self._record_event(
-                    sensor_id=sensor_id,
-                    event_time=now,
-                    channel="email",
-                    event_type="recovery",
-                    status=status,
-                    pm2_5=pm2_5,
-                    location=current_location,
-                    message=message,
-                )
+                if self._send_email(subject, message):
+                    self._record_event(
+                        sensor_id=sensor_id,
+                        event_time=now,
+                        channel="email",
+                        event_type="recovery",
+                        status=status,
+                        pm2_5=pm2_5,
+                        location=current_location,
+                        message=message,
+                    )
 
             self._save_state(
                 sensor_id=sensor_id,
@@ -188,7 +188,7 @@ class AlarmNotifier:
         )
 
         if should_send_email:
-            subject = f"Air quality alert: {status} at {current_location}"
+            subject = f"AirWatch Prishtina alert: {status} at {current_location}"
             message = self._format_message(
                 sensor_id=sensor_id,
                 location=current_location,
@@ -197,17 +197,17 @@ class AlarmNotifier:
                 timestamp=now,
                 event_type="alert",
             )
-            self._send_email(subject, message)
-            self._record_event(
-                sensor_id=sensor_id,
-                event_time=now,
-                channel="email",
-                event_type="alert",
-                status=status,
-                pm2_5=pm2_5,
-                location=current_location,
-                message=message,
-            )
+            if self._send_email(subject, message):
+                self._record_event(
+                    sensor_id=sensor_id,
+                    event_time=now,
+                    channel="email",
+                    event_type="alert",
+                    status=status,
+                    pm2_5=pm2_5,
+                    location=current_location,
+                    message=message,
+                )
 
         if should_send_sms:
             sms_message = self._format_sms_message(
@@ -216,17 +216,17 @@ class AlarmNotifier:
                 status=status,
                 pm2_5=pm2_5,
             )
-            self._send_sms(sms_message)
-            self._record_event(
-                sensor_id=sensor_id,
-                event_time=now,
-                channel="sms",
-                event_type="alert",
-                status=status,
-                pm2_5=pm2_5,
-                location=current_location,
-                message=sms_message,
-            )
+            if self._send_sms(sms_message):
+                self._record_event(
+                    sensor_id=sensor_id,
+                    event_time=now,
+                    channel="sms",
+                    event_type="alert",
+                    status=status,
+                    pm2_5=pm2_5,
+                    location=current_location,
+                    message=sms_message,
+                )
 
         self._save_state(
             sensor_id=sensor_id,
@@ -314,10 +314,10 @@ class AlarmNotifier:
             return True
         return datetime.now(timezone.utc) - last_sent_at >= timedelta(seconds=cooldown_seconds)
 
-    def _send_email(self, subject: str, body: str) -> None:
+    def _send_email(self, subject: str, body: str) -> bool:
         if not self.config.email_to:
             self.logger.info("Skipping email alert because ALERT_EMAIL_TO is empty.")
-            return
+            return False
 
         message = EmailMessage()
         message["From"] = self.config.email_from
@@ -334,19 +334,21 @@ class AlarmNotifier:
                     smtp.login(self.config.smtp_username, self.config.smtp_password)
                 smtp.send_message(message)
             self.logger.info("Sent email alert to %s", ", ".join(self.config.email_to))
+            return True
         except Exception as exc:
             self.logger.warning("Failed to send email alert: %s", exc)
+            return False
 
-    def _send_sms(self, body: str) -> None:
+    def _send_sms(self, body: str) -> bool:
         if not self.config.sms_to:
             self.logger.info("Skipping SMS alert because ALERT_SMS_TO is empty.")
-            return
+            return False
 
         if self.config.sms_provider != "twilio":
             self.logger.info(
                 "Skipping SMS alert because ALERT_SMS_PROVIDER is not set to twilio."
             )
-            return
+            return False
 
         if not all(
             [
@@ -358,7 +360,7 @@ class AlarmNotifier:
             self.logger.warning(
                 "Skipping SMS alert because Twilio credentials or ALERT_SMS_FROM are missing."
             )
-            return
+            return False
 
         auth = base64.b64encode(
             f"{self.config.twilio_account_sid}:{self.config.twilio_auth_token}".encode("utf-8")
@@ -383,10 +385,13 @@ class AlarmNotifier:
                 with urllib.request.urlopen(request, timeout=10):
                     pass
             self.logger.info("Sent SMS alert to %s", ", ".join(self.config.sms_to))
+            return True
         except urllib.error.URLError as exc:
             self.logger.warning("Failed to send SMS alert: %s", exc)
+            return False
         except Exception as exc:
             self.logger.warning("Unexpected SMS alert failure: %s", exc)
+            return False
 
     def _format_message(
         self,
@@ -398,12 +403,13 @@ class AlarmNotifier:
         event_type: str,
     ) -> str:
         return (
-            f"Air quality {event_type} detected.\n"
-            f"Sensor: {sensor_id}\n"
-            f"Location: {location}\n"
-            f"Status: {status}\n"
-            f"PM2.5: {pm2_5:.2f}\n"
-            f"Timestamp: {timestamp.isoformat()}\n"
+            f"AirWatch Prishtina {event_type} notice\n"
+            f"Monitoring area: {location}\n"
+            f"Sensor ID: {sensor_id}\n"
+            f"Air quality status: {status}\n"
+            f"PM2.5 reading: {pm2_5:.2f} ug/m3\n"
+            f"Checked at: {timestamp.isoformat()}\n"
+            f"Recommended action: review the dashboard and confirm whether the reading is temporary or persistent.\n"
         )
 
     def _format_sms_message(
@@ -414,6 +420,6 @@ class AlarmNotifier:
         pm2_5: float,
     ) -> str:
         return (
-            f"Air quality alert: {status} at {location} "
+            f"AirWatch Prishtina alert: {status} at {location} "
             f"(sensor {sensor_id}, PM2.5 {pm2_5:.2f})."
         )

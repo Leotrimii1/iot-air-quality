@@ -53,7 +53,7 @@ services:
       - kafka
     volumes:
       - ./docker/kafka/init-topic.sh:/init-topic.sh:ro
-    entrypoint: ["/bin/sh", "/init-topic.sh"]
+    entrypoint: ["/bin/sh", "-c", "tr -d '\\r' < /init-topic.sh > /tmp/init-topic.sh && /bin/sh /tmp/init-topic.sh"]
     restart: "no"
     networks:
       - iot_network
@@ -123,6 +123,11 @@ services:
       - CASSANDRA_KEYSPACE=air_quality
       - CASSANDRA_TABLE=air_quality
       - SENSOR_METADATA_TABLE=sensor_metadata
+      - ALARM_EVENTS_TABLE=alarm_events
+      - ANOMALY_EVENTS_TABLE=anomaly_events
+      - ANOMALY_PROFILE_TABLE=sensor_ai_profiles
+      - TRAINING_SAMPLE_TABLE=sensor_ai_samples
+      - AI_MODEL_MIN_TRAINING_SAMPLES=30
     depends_on:
       - mqtt
     networks:
@@ -159,9 +164,9 @@ services:
       - ALARM_EVENTS_TABLE=alarm_events
       - ALERT_SMTP_HOST=mailpit
       - ALERT_SMTP_PORT=1025
-      - ALERT_EMAIL_FROM=air-quality-alerts@example.com
-      - ALERT_EMAIL_TO=alerts@example.com
-      - ALERT_EMAIL_MIN_STATUS=Moderate
+      - ALERT_EMAIL_FROM=alerts@airwatch-prishtina.com
+      - ALERT_EMAIL_TO=operations@airwatch-prishtina.com
+      - ALERT_EMAIL_MIN_STATUS=Unhealthy
       - ALERT_SMS_PROVIDER=
       - ALERT_SMS_TO=
       - ALERT_SMS_MIN_STATUS=Unhealthy
