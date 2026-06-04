@@ -30,13 +30,13 @@ Simulatori perfaqeson sensore optike te tipit AirGradient dhe transmeton matje P
 - Bridge MQTT-to-Kafka i dergon mesazhet ne topic Kafka `air-quality` dhe log-on offset-in kur Kafka i pranon.
 - Spark Structured Streaming lexon mesazhet nga Kafka dhe llogarit statusin e cilesise se ajrit ne kohe reale.
 - Cassandra ruan matjet me rezultatet e AI-se te perfshira ne rresht, ndersa metadata e sensoreve ruhet vecmas.
-- Dashboard-i custom ne GUI lexon rezultatet nga Cassandra dhe shfaq grafe live.
+- Dashboard-i custom ne GUI lexon rezultatet nga Cassandra dhe shfaq PM2.5 Health View, Smart Monitor, alarmet dhe anomalite.
 - Grafana eshte e integruar brenda GUI-se si dashboard embedded.
 - Compose krijon automatikisht topic-un Kafka `air-quality` perpara se te niset procesori.
 - Alarmet ngrihen ne Spark kur PM2.5 kalon pragjet e klasifikimit dhe ruhen si evente ne Cassandra.
-- Anomali AI zbulohen ne kohe reale me `Isolation Forest` perpara se rreshti te ruhet ne Cassandra.
-- Dashboard-i tani shfaq nje panel `AI Status` me gjendjen e modelit, numrin e mostrave te pastra dhe anomaline e fundit.
-- Email alerts dergohen ne Mailpit qe mund t'i shikosh ne `http://localhost:8025`.
+- Anomalite zbulohen ne kohe reale perpara se rreshti te ruhet ne Cassandra.
+- Dashboard-i tani shfaq nje panel `Smart Monitor` me gjendjen e monitorimit, numrin e mostrave te pastra dhe anomaline e fundit.
+- Email alerts dergohen ne Mailpit me identitetin `AirWatch Prishtina`, p.sh. nga `alerts@airwatch-prishtina.com` te `operations@airwatch-prishtina.com`.
 - SMS alerts mbeshteten opsionalisht me Twilio kur vendosen variablat perkates.
 
 ## Formati i te Dhenave
@@ -122,7 +122,9 @@ CREATE TABLE air_quality.quality_ranks (
 ) WITH CLUSTERING ORDER BY (rank_order ASC);
 ```
 
-Tabela `air_quality` ruan matjet kryesore dhe lokacionin per query te shpejta. Metadata me e plote e sensorit ruhet ne `sensor_metadata`, ndersa pragjet e klasifikimit ruhen ne `quality_ranks`.
+Tabela `air_quality` ruan vetem te dhenat e nevojshme per rezultatet operative: `sensor_id`, `timestamp`, `pm1`, `pm2_5`, `status`, `location` dhe fushat e AI-se. Payload-i i plote i sensorit nuk ruhet si raw JSON, sepse `battery`, `signal`, `message_id` dhe fusha te tjera perdoren vetem per transport/simulim dhe nuk jane te nevojshme per query kryesore.
+
+Metadata e sensorit ruhet ndaras ne `sensor_metadata`: tipi, firmware, lokacioni, koordinatat dhe njesia matese. Procesori i mban keto metadata edhe ne memory cache dhe i shkruan ne Cassandra vetem kur sensori eshte i ri ose metadata ka ndryshuar. Pragjet e klasifikimit ruhen ne `quality_ranks` dhe lexohen kur starton Spark Streaming.
 
 Procesori krijon edhe keto tabela per alarmet:
 
@@ -150,18 +152,9 @@ CREATE TABLE air_quality.alarm_events (
 CREATE TABLE air_quality.sensor_ai_profiles (
     sensor_id text PRIMARY KEY,
     sample_count int,
-    pm1_count int,
-    pm1_mean double,
-    pm1_m2 double,
-    pm2_5_count int,
-    pm2_5_mean double,
-    pm2_5_m2 double,
-    relative_humidity_count int,
-    relative_humidity_mean double,
-    relative_humidity_m2 double,
-    temperature_count int,
-    temperature_mean double,
-    temperature_m2 double,
+    trained_on_samples int,
+    last_trained_at timestamp,
+    last_scored_at timestamp,
     updated_at timestamp
 );
 
@@ -193,7 +186,16 @@ CREATE TABLE air_quality.sensor_ai_samples (
 
 Rreshti kalon fillimisht ne motorin e zbulimit te anomalive, pastaj ruhet ne Cassandra bashke me `anomaly_score`, `is_anomaly` dhe `anomaly_reason`. `Isolation Forest` trajnohet ne kohe reale nga mostra te pastra qe ruhen ne `sensor_ai_samples`, ndersa metadata e trajnimit ruhet ne `sensor_ai_profiles`.
 
-Email alerts dergohen kur statusi kalon pragun `ALERT_EMAIL_MIN_STATUS` dhe shmangen duplicate me cooldown. Recovery email mund te dergohet kur statusi kthehet ne `Good`. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
+Email alerts dergohen kur statusi kalon pragun `ALERT_EMAIL_MIN_STATUS`. Default-i i projektit eshte `Unhealthy`, sepse `Moderate` prodhon shume njoftime dhe nuk eshte i pershtatshem per alarmim operativ. Duplicate shmangen me cooldown. Recovery email mund te dergohet kur statusi zbret nen pragun e alarmit. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
+
+Konfigurimi demo i email-it perdor adresa te brendshme te sistemit:
+
+```text
+From: alerts@airwatch-prishtina.com
+To: operations@airwatch-prishtina.com
+```
+
+Keto adresa ruhen brenda Mailpit per testim dhe nuk dergojne email ne internet.
 
 ## Dashboard dhe Grafana
 
@@ -201,17 +203,34 @@ GUI-ja ne `http://localhost:5001` perfshin dashboard-in e vizualizimit. Te dhena
 
 Ne tab-in `Dashboard` ka dy shtresa vizualizimi:
 
-- Dashboard custom me karta, graf PM1/PM2.5 dhe tabela te sensoreve.
+- Dashboard custom me karta, PM2.5 Health View, Smart Monitor, tabela te sensoreve dhe panel alarmesh.
 - Grafana Analytics e integruar brenda GUI-se me iframe.
 
 Panelet e perfshira:
 
-- Grafiku kohor per PM1
-- Grafiku kohor per PM2.5
 - Paneli i statusit te cilesise se ajrit
-- Paneli me vlerat me te fundit
+- Paneli `PM2.5 Health View` me gauge te pragjeve `Good`, `Moderate`, `Unhealthy`, `Very Unhealthy`
 - Tabela e metadata-s se sensoreve
-- Grafana dashboard i integruar nga `http://localhost:3000`
+- Paneli `Alarmet dhe Anomalite` me email/recovery alerts dhe anomaly events
+- Paneli `Smart Monitor` per gjendjen e monitorimit automatik
+- Grafana dashboard i integruar nga `http://localhost:3000` per historikun kohor dhe analiza me te detajuara
+
+## AI dhe Alarmet
+
+AI ne projekt eshte implementuar si zbulim anomalish ne kohe reale, jo si model parashikimi. Kjo i pershtatet mire ketij rasti sepse sensoret dergojne rrjedhe te vazhdueshme matjesh dhe sistemi duhet te kape vlera te pazakonta para se te ruhen si rezultat final.
+
+Procesi eshte:
+
+- Spark Streaming lexon mesazhet nga Kafka.
+- Rreshti strukturohet ne kolona reale te sensorit: `pm1`, `pm2_5`, `relative_humidity`, `temperature`, `status`, `location` dhe metadata bazike.
+- Metadata e sensorit kontrollohet me memory cache dhe ruhet vetem kur eshte e re ose ka ndryshuar.
+- `Isolation Forest` trajnohet per secilin sensor nga mostra te pastra ne `sensor_ai_samples`.
+- Ne realtime, AI e vlereson rreshtin perpara se rreshti final te ruhet ne `air_quality`.
+- Gjendja e modelit ruhet ne `sensor_ai_profiles`, prandaj dashboard-i mund te tregoje nese modeli eshte ende duke mesuar apo eshte trajnuar.
+- Nese AI zbulon anomali, eventi ruhet ne `anomaly_events`.
+- Alarmet operative perdorin statusin e PM2.5 dhe ruhen ne `alarm_events`; email dergohet vetem nga `Unhealthy` e lart.
+
+Per nivel projekti/enterprise demo, ky kombinim eshte i mire: rregullat e PM2.5 jane te shpjegueshme, ndersa AI kap sjellje te pazakonta qe nuk duken vetem me prag statik. Per nje sistem enterprise te plote do te shtoheshin edhe model versioning, monitorim i drift-it, alert topic ne Kafka per integrime te jashtme dhe ruajtje e metrikave te performances se modelit.
 
 ## Ekzekutimi
 
@@ -334,6 +353,24 @@ Kontrollimi i eventeve te alarmit:
 
 ```powershell
 docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.alarm_events LIMIT 10;"
+```
+
+Kontrollimi i gjendjes se cooldown/recovery per sensore:
+
+```powershell
+docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.alarm_state LIMIT 10;"
+```
+
+Kontrollimi i anomalive:
+
+```powershell
+docker compose exec cassandra cqlsh -e "SELECT * FROM air_quality.anomaly_events LIMIT 10;"
+```
+
+Email alert-et e testit shihen ne:
+
+```text
+http://localhost:8025
 ```
 
 Kontrollimi nese Kafka topic ekziston:

@@ -19,13 +19,15 @@ TOPIC = os.getenv("MQTT_TOPIC", "air-quality/sensor1")
 UI_PORT = int(os.getenv("SIMULATOR_UI_PORT", "5000"))
 DEFAULT_SENSOR_COUNT = int(os.getenv("SIMULATOR_SENSOR_COUNT", "3"))
 DEFAULT_INTERVAL_MS = int(os.getenv("SIMULATOR_INTERVAL_MS", "1000"))
+DEFAULT_SCENARIO = os.getenv("SIMULATOR_SCENARIO", "normal")
 MAX_LIVE_READINGS = int(os.getenv("SIMULATOR_MAX_LIVE_READINGS", "60"))
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "cassandra")
 CASSANDRA_KEYSPACE = os.getenv("CASSANDRA_KEYSPACE", "air_quality")
 CASSANDRA_TABLE = os.getenv("CASSANDRA_TABLE", "air_quality")
 SENSOR_METADATA_TABLE = os.getenv("SENSOR_METADATA_TABLE", "sensor_metadata")
-ANOMALY_PROFILE_TABLE = os.getenv("ANOMALY_PROFILE_TABLE", "sensor_ai_profiles")
+ALARM_EVENTS_TABLE = os.getenv("ALARM_EVENTS_TABLE", "alarm_events")
 ANOMALY_EVENTS_TABLE = os.getenv("ANOMALY_EVENTS_TABLE", "anomaly_events")
+ANOMALY_PROFILE_TABLE = os.getenv("ANOMALY_PROFILE_TABLE", "sensor_ai_profiles")
 TRAINING_SAMPLE_TABLE = os.getenv("TRAINING_SAMPLE_TABLE", "sensor_ai_samples")
 MIN_TRAINING_SAMPLES = int(os.getenv("AI_MODEL_MIN_TRAINING_SAMPLES", "30"))
 MODEL_WINDOW_SIZE = int(os.getenv("AI_MODEL_WINDOW_SIZE", "200"))
@@ -48,6 +50,7 @@ simulator_state = {
     "running": False,
     "sensor_count": DEFAULT_SENSOR_COUNT,
     "interval_ms": DEFAULT_INTERVAL_MS,
+    "scenario": DEFAULT_SCENARIO,
     "total_published": 0,
     "last_batch_count": 0,
     "last_batch_duration_ms": 0,
@@ -197,7 +200,8 @@ INDEX_HTML = """
       font-weight: 640;
     }
 
-    input {
+    input,
+    select {
       width: 100%;
       height: 42px;
       border: 1px solid var(--line);
@@ -209,7 +213,8 @@ INDEX_HTML = """
       outline: none;
     }
 
-    input:focus {
+    input:focus,
+    select:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
     }
@@ -263,6 +268,99 @@ INDEX_HTML = """
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 12px;
       margin-bottom: 18px;
+    }
+
+    .simulator-insights {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .flow-panel {
+      padding: 18px;
+      background:
+        linear-gradient(180deg, rgba(232, 240, 255, 0.72) 0%, rgba(255, 255, 255, 0.96) 52%),
+        #ffffff;
+    }
+
+    .flow-steps {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .flow-step {
+      min-height: 88px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    .flow-step strong {
+      display: block;
+      color: #1745a1;
+      font-size: 15px;
+      overflow-wrap: anywhere;
+    }
+
+    .flow-step span {
+      display: block;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .scenario-panel {
+      padding: 18px;
+    }
+
+    .scenario-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 0 10px;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-weight: 760;
+      text-transform: capitalize;
+    }
+
+    .scenario-badge.hot {
+      background: #fff0f0;
+      color: #b8333a;
+    }
+
+    .mini-stat-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .mini-stat {
+      min-height: 70px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+    }
+
+    .mini-stat p {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .mini-stat strong {
+      color: var(--ink);
+      font-size: 18px;
     }
 
     .metric {
@@ -460,20 +558,141 @@ INDEX_HTML = """
 
     .dashboard-layout {
       display: grid;
-      grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.55fr);
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 18px;
-      align-items: start;
+      align-items: stretch;
     }
 
-    .chart-wrap {
-      height: 360px;
-      width: 100%;
+    .health-panel {
+      min-height: 360px;
+      background:
+        linear-gradient(180deg, rgba(232, 240, 255, 0.82) 0%, rgba(255, 255, 255, 0.96) 46%),
+        #ffffff;
     }
 
-    canvas {
-      width: 100%;
-      height: 100%;
-      display: block;
+    .health-hero {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+      gap: 18px;
+      align-items: end;
+      margin: 16px 0 22px;
+    }
+
+    .pollutant-hero {
+      min-width: 0;
+    }
+
+    .health-value {
+      margin: 0;
+      color: #1745a1;
+      font-size: 56px;
+      line-height: 0.95;
+      font-weight: 780;
+    }
+
+    .health-unit {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .health-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-weight: 760;
+      white-space: nowrap;
+    }
+
+    .health-badge.good {
+      background: #e7f7ef;
+      color: #16784c;
+    }
+
+    .health-badge.warn {
+      background: #fff4df;
+      color: #b85b00;
+    }
+
+    .health-badge.bad {
+      background: #fff0f0;
+      color: #b8333a;
+    }
+
+    .gauge-track {
+      position: relative;
+      height: 18px;
+      border-radius: 8px;
+      overflow: hidden;
+      background: linear-gradient(90deg, #16a34a 0 15%, #f59e0b 15% 35%, #ef4444 35% 70%, #7f1d1d 70% 100%);
+      box-shadow: inset 0 0 0 1px rgba(19, 34, 56, 0.1);
+    }
+
+    .gauge-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 0%;
+      background: rgba(255, 255, 255, 0.34);
+      border-right: 3px solid #ffffff;
+      transition: width 250ms ease;
+    }
+
+    .gauge-marker {
+      position: absolute;
+      top: -7px;
+      left: 0%;
+      width: 4px;
+      height: 32px;
+      border-radius: 8px;
+      background: #132238;
+      transform: translateX(-2px);
+      transition: left 250ms ease;
+    }
+
+    .threshold-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .reading-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .detail-card {
+      min-height: 78px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }
+
+    .detail-card p {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .detail-card strong {
+      color: var(--ink);
+      font-size: 18px;
+      overflow-wrap: anywhere;
     }
 
     .sensor-table {
@@ -499,6 +718,26 @@ INDEX_HTML = """
     .table-scroll {
       max-height: 360px;
       overflow: auto;
+    }
+
+    .sensor-panel {
+      min-height: 360px;
+    }
+
+    .sensor-panel .table-scroll {
+      max-height: 285px;
+      overflow-y: auto;
+      overflow-x: auto;
+    }
+
+    .alerts-panel {
+      margin-top: 18px;
+    }
+
+    .event-message {
+      max-width: 420px;
+      white-space: normal;
+      color: var(--muted);
     }
 
     .status-chip {
@@ -571,7 +810,19 @@ INDEX_HTML = """
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
 
+      .simulator-insights {
+        grid-template-columns: 1fr;
+      }
+
+      .flow-steps {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
       .ai-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .reading-detail-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
@@ -595,7 +846,27 @@ INDEX_HTML = """
         grid-template-columns: 1fr;
       }
 
+      .flow-steps {
+        grid-template-columns: 1fr;
+      }
+
+      .mini-stat-grid {
+        grid-template-columns: 1fr;
+      }
+
       .ai-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .health-hero {
+        grid-template-columns: 1fr;
+      }
+
+      .health-value {
+        font-size: 42px;
+      }
+
+      .reading-detail-grid {
         grid-template-columns: 1fr;
       }
 
@@ -615,7 +886,7 @@ INDEX_HTML = """
     <header>
       <div>
         <h1>Air Quality Simulator</h1>
-        <p class="subtitle">Simulator GUI per pipeline-in IoT</p>
+        <p class="subtitle">Monitorim i cilesise se ajrit ne kohe reale</p>
       </div>
       <div class="status-pill">
         <span id="statusDot" class="dot"></span>
@@ -652,6 +923,62 @@ INDEX_HTML = """
       </div>
     </div>
 
+    <div class="simulator-insights">
+      <section class="flow-panel">
+        <div class="live-header">
+          <h2 class="panel-title">Data Flow</h2>
+          <span id="flowState" class="live-count">stopped</span>
+        </div>
+        <div class="flow-steps">
+          <div class="flow-step">
+            <strong>Sensor</strong>
+            <span>PM1, PM2.5, temperature</span>
+          </div>
+          <div class="flow-step">
+            <strong>MQTT</strong>
+            <span>live sensor messages</span>
+          </div>
+          <div class="flow-step">
+            <strong>Kafka</strong>
+            <span>stream buffer</span>
+          </div>
+          <div class="flow-step">
+            <strong>Spark</strong>
+            <span>status and anomaly check</span>
+          </div>
+          <div class="flow-step">
+            <strong>Cassandra</strong>
+            <span>clean structured storage</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="scenario-panel">
+        <div class="live-header">
+          <h2 class="panel-title">Simulation Profile</h2>
+          <span id="scenarioBadge" class="scenario-badge">normal</span>
+        </div>
+        <div class="mini-stat-grid">
+          <div class="mini-stat">
+            <p>Batch</p>
+            <strong id="miniBatch">0</strong>
+          </div>
+          <div class="mini-stat">
+            <p>Runtime</p>
+            <strong id="miniRuntime">0s</strong>
+          </div>
+          <div class="mini-stat">
+            <p>Target</p>
+            <strong id="miniTarget">0/sec</strong>
+          </div>
+          <div class="mini-stat">
+            <p>Scenario</p>
+            <strong id="miniScenario">Normal</strong>
+          </div>
+        </div>
+      </section>
+    </div>
+
     <div class="layout">
       <aside>
         <section class="panel">
@@ -677,6 +1004,13 @@ INDEX_HTML = """
             <label for="intervalMs">Frekuenca e dergimit (ms)</label>
             <input id="intervalMs" type="number" min="10" max="60000" step="10" value="1000">
           </div>
+          <div class="field">
+            <label for="scenario">Skenari</label>
+            <select id="scenario">
+              <option value="normal">Normal</option>
+              <option value="pollution_spike">Pollution spike</option>
+            </select>
+          </div>
           <button id="applyButton" class="ghost" type="button">Apliko</button>
         </section>
       </aside>
@@ -697,7 +1031,12 @@ INDEX_HTML = """
         <div class="metric">
           <p class="metric-label">Sensore aktive</p>
           <p id="dbActiveSensors" class="metric-value">0</p>
-          <p class="metric-note">nga metadata</p>
+          <p class="metric-note">ne monitorim</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">PM1 i fundit</p>
+          <p id="dbLatestPm1" class="metric-value">0.0</p>
+          <p class="metric-note">ug/m3</p>
         </div>
         <div class="metric">
           <p class="metric-label">PM2.5 i fundit</p>
@@ -707,27 +1046,73 @@ INDEX_HTML = """
         <div class="metric">
           <p class="metric-label">Statusi</p>
           <p id="dbStatus" class="metric-value">-</p>
-          <p class="metric-note">nga Spark</p>
+          <p class="metric-note">nga matjet e fundit</p>
         </div>
         <div class="metric">
           <p class="metric-label">Lokacioni</p>
           <p id="dbLocation" class="metric-value">-</p>
-          <p class="metric-note">nga Cassandra</p>
+          <p class="metric-note">zona e monitoruar</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Alarme</p>
+          <p id="dbAlertCount" class="metric-value">0</p>
+          <p class="metric-note">njoftime aktive</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Anomali</p>
+          <p id="dbAnomalyCount" class="metric-value">0</p>
+          <p class="metric-note">nga monitori automatik</p>
         </div>
       </div>
 
       <div class="dashboard-layout">
-        <section class="panel">
+        <section class="panel health-panel">
           <div class="live-header">
-            <h2 class="panel-title">PM1 / PM2.5</h2>
+            <h2 class="panel-title">PM1 / PM2.5 Overview</h2>
             <span id="chartSensor" class="live-count">airgradient_prishtina_001</span>
           </div>
-          <div class="chart-wrap">
-            <canvas id="pmChart"></canvas>
+          <div class="health-hero">
+            <div>
+              <p id="healthPm1" class="health-value">-</p>
+              <p class="health-unit">PM1 ug/m3 nga matja e fundit</p>
+            </div>
+            <div>
+              <p id="healthPm25" class="health-value">-</p>
+              <p class="health-unit">PM2.5 ug/m3 nga matja e fundit</p>
+            </div>
+            <span id="healthBadge" class="health-badge">No data</span>
+          </div>
+          <div class="gauge-track" aria-label="PM2.5 threshold gauge">
+            <div id="pmGaugeFill" class="gauge-fill"></div>
+            <div id="pmGaugeMarker" class="gauge-marker"></div>
+          </div>
+          <div class="threshold-row">
+            <span>Good</span>
+            <span>Moderate</span>
+            <span>Unhealthy</span>
+            <span>Very Unhealthy</span>
+          </div>
+          <div class="reading-detail-grid">
+            <div class="detail-card">
+              <p>PM1</p>
+              <strong id="detailPm1">-</strong>
+            </div>
+            <div class="detail-card">
+              <p>PM2.5</p>
+              <strong id="detailPm25">-</strong>
+            </div>
+            <div class="detail-card">
+              <p>Status</p>
+              <strong id="detailStatus">-</strong>
+            </div>
+            <div class="detail-card">
+              <p>Monitor</p>
+              <strong id="detailAi">-</strong>
+            </div>
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel sensor-panel">
           <div class="live-header">
             <h2 class="panel-title">Sensoret</h2>
             <span id="sensorTableCount" class="live-count">0</span>
@@ -749,45 +1134,68 @@ INDEX_HTML = """
 
       <section class="panel ai-status">
         <div class="live-header">
-          <h2 class="panel-title">AI Status</h2>
+          <h2 class="panel-title">Smart Monitor</h2>
           <span id="aiStatusBadge" class="status-chip">Warming up</span>
         </div>
         <div class="ai-grid">
           <div class="ai-card">
-            <p class="ai-label">Model</p>
-            <p id="aiModelName" class="ai-value">Isolation Forest</p>
-            <p id="aiModelNote" class="ai-subtext">Real-time model per sensor</p>
+            <p class="ai-label">Monitor</p>
+            <p id="aiModelName" class="ai-value">Automatic</p>
+            <p id="aiModelNote" class="ai-subtext">Learning live sensor patterns</p>
           </div>
           <div class="ai-card">
-            <p class="ai-label">Training</p>
+            <p class="ai-label">Learning</p>
             <p id="aiTrainingState" class="ai-value">0 / 30</p>
             <p id="aiTrainingNote" class="ai-subtext">clean samples collected</p>
           </div>
           <div class="ai-card">
-            <p class="ai-label">Latest Score</p>
+            <p class="ai-label">Anomaly Level</p>
             <p id="aiLatestScore" class="ai-value">-</p>
             <p id="aiLatestReason" class="ai-subtext">No anomaly evaluated yet</p>
           </div>
           <div class="ai-card">
-            <p class="ai-label">Last Trained</p>
+            <p class="ai-label">Last Updated</p>
             <p id="aiLastTrained" class="ai-value">-</p>
             <p id="aiLastScored" class="ai-subtext">Not scored yet</p>
           </div>
         </div>
       </section>
 
+      <section class="panel alerts-panel">
+        <div class="live-header">
+          <h2 class="panel-title">Alarmet dhe Anomalite</h2>
+          <span id="alertTableCount" class="live-count">0 evente</span>
+        </div>
+        <div class="table-scroll">
+          <table class="sensor-table">
+            <thead>
+              <tr>
+                <th>Koha</th>
+                <th>Sensor</th>
+                <th>Tipi</th>
+                <th>Statusi</th>
+                <th>PM1</th>
+                <th>PM2.5</th>
+                <th>Mesazhi</th>
+              </tr>
+            </thead>
+            <tbody id="alertTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+
       <section class="panel grafana-panel">
         <div class="grafana-header">
           <div>
-            <h2 class="panel-title">Grafana Analytics</h2>
-            <span class="live-count">Dashboard i integruar nga Grafana</span>
+            <h2 class="panel-title">Analiza e te dhenave</h2>
+            <span class="live-count">Historiku dhe krahasimet e fundit</span>
           </div>
-          <a class="external-link" href="http://localhost:3000/d/prishtina-air-quality/prishtina-air-quality?orgId=1&from=now-30m&to=now&theme=light" target="_blank" rel="noreferrer">Hap ne Grafana</a>
+          <a class="external-link" href="http://localhost:3000/d/prishtina-air-quality/prishtina-air-quality?orgId=1&from=now-30m&to=now&theme=light" target="_blank" rel="noreferrer">Hap analizen</a>
         </div>
         <iframe
           class="grafana-frame"
           src="http://localhost:3000/d/prishtina-air-quality/prishtina-air-quality?orgId=1&from=now-30m&to=now&theme=light&kiosk"
-          title="Grafana Air Quality Dashboard"
+          title="Air Quality Analytics"
         ></iframe>
       </section>
     </div>
@@ -797,6 +1205,7 @@ INDEX_HTML = """
     const sensorCount = document.getElementById("sensorCount");
     const configSensorCount = document.getElementById("configSensorCount");
     const intervalMs = document.getElementById("intervalMs");
+    const scenario = document.getElementById("scenario");
     const statusDot = document.getElementById("statusDot");
     const statusText = document.getElementById("statusText");
     const errorBox = document.getElementById("errorBox");
@@ -806,7 +1215,6 @@ INDEX_HTML = """
     const dashboardTab = document.getElementById("dashboardTab");
     const simulatorView = document.getElementById("simulatorView");
     const dashboardView = document.getElementById("dashboardView");
-    const pmChart = document.getElementById("pmChart");
     let activeDashboardSensor = "airgradient_prishtina_001";
 
     function numberValue(input, fallback) {
@@ -818,6 +1226,7 @@ INDEX_HTML = """
       return {
         sensor_count: numberValue(configSensorCount, numberValue(sensorCount, 3)),
         interval_ms: numberValue(intervalMs, 1000),
+        scenario: scenario.value,
       };
     }
 
@@ -830,6 +1239,34 @@ INDEX_HTML = """
         return "-";
       }
       return Number(value).toFixed(1);
+    }
+
+    function scenarioLabel(value) {
+      return value === "pollution_spike" ? "Pollution spike" : "Normal";
+    }
+
+    function anomalyLevel(score, isAnomaly) {
+      const parsed = Number(score);
+      if (!isAnomaly || !Number.isFinite(parsed)) {
+        return "Normal";
+      }
+      if (parsed >= 0.12) {
+        return "High";
+      }
+      if (parsed >= 0.05) {
+        return "Elevated";
+      }
+      return "Low";
+    }
+
+    function anomalyMessage(ai) {
+      if (ai && ai.latest && ai.latest.is_anomaly) {
+        return "Unusual pattern detected in the latest reading";
+      }
+      if (ai && ai.trained) {
+        return "Latest reading follows the expected pattern";
+      }
+      return "Learning normal sensor behavior";
     }
 
     function formatDateTime(value) {
@@ -924,7 +1361,7 @@ INDEX_HTML = """
         row.innerHTML = `
           <span>
             <span class="reading-name">Sensor ${reading.sensor_number}</span>
-            <span class="reading-label">PM2.5</span>
+            <span class="reading-label">PM1 ${reading.pm1.toFixed(1)} / PM2.5</span>
           </span>
           <span class="reading-value">${reading.pm2_5.toFixed(1)}</span>
         `;
@@ -934,7 +1371,7 @@ INDEX_HTML = """
     }
 
     function isEditingConfig() {
-      return [sensorCount, configSensorCount, intervalMs].includes(document.activeElement);
+      return [sensorCount, configSensorCount, intervalMs, scenario].includes(document.activeElement);
     }
 
     function renderStatus(data) {
@@ -942,6 +1379,7 @@ INDEX_HTML = """
         sensorCount.value = data.sensor_count;
         configSensorCount.value = data.sensor_count;
         intervalMs.value = data.interval_ms;
+        scenario.value = data.scenario || "normal";
       }
 
       statusDot.className = data.running ? "dot running" : "dot";
@@ -954,6 +1392,17 @@ INDEX_HTML = """
       document.getElementById("metricInterval").textContent = `${data.interval_ms} ms`;
       document.getElementById("metricRate").textContent = formatNumber(data.target_rate);
       document.getElementById("metricTotal").textContent = formatNumber(data.total_published);
+      document.getElementById("flowState").textContent = data.running ? "streaming" : "stopped";
+      document.getElementById("miniBatch").textContent = formatNumber(data.last_batch_count || 0);
+      document.getElementById("miniRuntime").textContent = `${formatNumber(data.uptime_seconds || 0)}s`;
+      document.getElementById("miniTarget").textContent = `${formatNumber(data.target_rate || 0)}/sec`;
+      document.getElementById("miniScenario").textContent = scenarioLabel(data.scenario);
+      const scenarioBadge = document.getElementById("scenarioBadge");
+      scenarioBadge.className = "scenario-badge";
+      if (data.scenario === "pollution_spike") {
+        scenarioBadge.classList.add("hot");
+      }
+      scenarioBadge.textContent = scenarioLabel(data.scenario);
       renderLive(data.live_readings, data.sensor_count);
 
       showError(data.last_error || "");
@@ -978,90 +1427,85 @@ INDEX_HTML = """
       });
     }
 
-    function drawLine(ctx, points, key, color, bounds, padding) {
-      if (!points.length) {
-        return;
+    function statusChipClass(status) {
+      if (status === "Good") {
+        return "good";
       }
-
-      ctx.beginPath();
-      points.forEach((point, index) => {
-        const value = Number(point[key]);
-        const x = padding.left + (index / Math.max(points.length - 1, 1)) * bounds.width;
-        const ratio = (value - bounds.min) / Math.max(bounds.max - bounds.min, 1);
-        const y = padding.top + bounds.height - (ratio * bounds.height);
-        if (index === 0) {
-          ctx.moveTo(x, y);
-        } else {
-          ctx.lineTo(x, y);
-        }
-      });
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 3;
-      ctx.lineJoin = "round";
-      ctx.lineCap = "round";
-      ctx.stroke();
+      if (status === "Moderate") {
+        return "warn";
+      }
+      if (status === "Unhealthy" || status === "Very Unhealthy") {
+        return "bad";
+      }
+      return "";
     }
 
-    function drawChart(points) {
-      const rect = pmChart.getBoundingClientRect();
-      const ratio = window.devicePixelRatio || 1;
-      pmChart.width = Math.max(1, Math.floor(rect.width * ratio));
-      pmChart.height = Math.max(1, Math.floor(rect.height * ratio));
-
-      const ctx = pmChart.getContext("2d");
-      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-      ctx.clearRect(0, 0, rect.width, rect.height);
-
-      const padding = { top: 18, right: 18, bottom: 28, left: 44 };
-      const width = rect.width - padding.left - padding.right;
-      const height = rect.height - padding.top - padding.bottom;
-
-      ctx.fillStyle = "#f8fbff";
-      ctx.fillRect(0, 0, rect.width, rect.height);
-      ctx.strokeStyle = "#d7e3f5";
-      ctx.lineWidth = 1;
-
-      for (let i = 0; i <= 4; i += 1) {
-        const y = padding.top + (height / 4) * i;
-        ctx.beginPath();
-        ctx.moveTo(padding.left, y);
-        ctx.lineTo(padding.left + width, y);
-        ctx.stroke();
+    function renderHealthGauge(latest, ai) {
+      const pm25 = latest ? Number(latest.pm2_5) : NaN;
+      const percent = Number.isFinite(pm25) ? Math.max(0, Math.min(100, (pm25 / 100) * 100)) : 0;
+      const badge = document.getElementById("healthBadge");
+      document.getElementById("healthPm1").textContent = latest ? formatDecimal(latest.pm1) : "-";
+      document.getElementById("healthPm25").textContent = Number.isFinite(pm25) ? formatDecimal(pm25) : "-";
+      document.getElementById("detailPm1").textContent = latest ? formatDecimal(latest.pm1) : "-";
+      document.getElementById("detailPm25").textContent = Number.isFinite(pm25) ? formatDecimal(pm25) : "-";
+      document.getElementById("detailStatus").textContent = latest ? latest.status : "-";
+      document.getElementById("detailAi").textContent =
+        ai && ai.latest && ai.latest.is_anomaly ? "Anomaly" : (ai && ai.trained ? "Normal" : "Learning");
+      document.getElementById("pmGaugeFill").style.width = `${percent}%`;
+      document.getElementById("pmGaugeMarker").style.left = `${percent}%`;
+      badge.className = "health-badge";
+      if (latest && statusChipClass(latest.status)) {
+        badge.classList.add(statusChipClass(latest.status));
       }
+      badge.textContent = latest ? latest.status : "No data";
+    }
 
-      if (!points.length) {
-        ctx.fillStyle = "#64748b";
-        ctx.font = "14px system-ui";
-        ctx.fillText("Nuk ka ende te dhena nga Cassandra", padding.left, padding.top + 28);
+    function renderAlerts(alerts, anomalies) {
+      const body = document.getElementById("alertTableBody");
+      const events = [
+        ...(alerts || []).map((event) => ({
+          time: event.event_time,
+          sensor_id: event.sensor_id,
+          type: event.event_type || event.notification_channel || "alert",
+          status: event.status || "-",
+          pm1: event.pm1,
+          pm2_5: event.pm2_5,
+          message: event.message || "-",
+        })),
+        ...(anomalies || []).map((event) => ({
+          time: event.event_time,
+          sensor_id: event.sensor_id,
+          type: event.is_anomaly ? "anomaly" : "normal",
+          status: event.status || "-",
+          pm1: event.pm1,
+          pm2_5: event.pm2_5,
+          message: event.is_anomaly ? "Unusual reading pattern detected" : "Reading follows expected pattern",
+        })),
+      ].sort((left, right) => new Date(right.time || 0) - new Date(left.time || 0));
+
+      body.innerHTML = "";
+      document.getElementById("alertTableCount").textContent = `${events.length} evente`;
+
+      if (!events.length) {
+        const row = document.createElement("tr");
+        row.innerHTML = `<td colspan="7">Nuk ka ende alarme ose anomali.</td>`;
+        body.appendChild(row);
         return;
       }
 
-      const values = points.flatMap((point) => [Number(point.pm1), Number(point.pm2_5)]);
-      const maxValue = Math.max(...values, 35);
-      const minValue = Math.min(...values, 0);
-      const bounds = {
-        min: Math.max(0, Math.floor(minValue - 5)),
-        max: Math.ceil(maxValue + 5),
-        width,
-        height,
-      };
-
-      ctx.fillStyle = "#64748b";
-      ctx.font = "12px system-ui";
-      ctx.fillText(`${bounds.max}`, 8, padding.top + 4);
-      ctx.fillText(`${bounds.min}`, 8, padding.top + height);
-
-      drawLine(ctx, points, "pm1", "#38bdf8", bounds, padding);
-      drawLine(ctx, points, "pm2_5", "#2563eb", bounds, padding);
-
-      ctx.fillStyle = "#38bdf8";
-      ctx.fillRect(padding.left, rect.height - 18, 12, 4);
-      ctx.fillStyle = "#132238";
-      ctx.fillText("PM1", padding.left + 18, rect.height - 14);
-      ctx.fillStyle = "#2563eb";
-      ctx.fillRect(padding.left + 70, rect.height - 18, 12, 4);
-      ctx.fillStyle = "#132238";
-      ctx.fillText("PM2.5", padding.left + 88, rect.height - 14);
+      events.slice(0, 40).forEach((event) => {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td>${escapeHtml(formatDateTime(event.time))}</td>
+          <td>${escapeHtml(event.sensor_id)}</td>
+          <td><span class="status-chip">${escapeHtml(event.type)}</span></td>
+          <td>${escapeHtml(event.status)}</td>
+          <td>${escapeHtml(formatDecimal(event.pm1))}</td>
+          <td>${escapeHtml(formatDecimal(event.pm2_5))}</td>
+          <td class="event-message">${escapeHtml(event.message)}</td>
+        `;
+        body.appendChild(row);
+      });
     }
 
     function renderDashboard(data) {
@@ -1069,12 +1513,16 @@ INDEX_HTML = """
       const ai = data.ai_status || {};
       showError(data.error || "");
       document.getElementById("dbActiveSensors").textContent = formatNumber(data.sensors.length);
+      document.getElementById("dbLatestPm1").textContent = latest ? formatDecimal(latest.pm1) : "-";
       document.getElementById("dbLatestPm25").textContent = latest ? formatDecimal(latest.pm2_5) : "-";
       document.getElementById("dbStatus").textContent = latest ? latest.status : "-";
       document.getElementById("dbLocation").textContent = latest ? latest.location : "-";
+      document.getElementById("dbAlertCount").textContent = formatNumber((data.alerts || []).length);
+      document.getElementById("dbAnomalyCount").textContent = formatNumber((data.anomalies || []).length);
       document.getElementById("chartSensor").textContent = data.sensor_id;
       renderSensors(data.sensors);
-      drawChart(data.timeseries);
+      renderHealthGauge(latest, ai);
+      renderAlerts(data.alerts || [], data.anomalies || []);
 
       const aiBadge = document.getElementById("aiStatusBadge");
       aiBadge.className = "status-chip";
@@ -1086,23 +1534,18 @@ INDEX_HTML = """
         aiBadge.classList.add("warn");
       }
       aiBadge.textContent = ai.status || "Warming up";
-      document.getElementById("aiModelName").textContent = ai.model_name || "Isolation Forest";
-      document.getElementById("aiModelNote").textContent = ai.trained ? "Model is trained and scoring live data" : "Model is still learning";
+      document.getElementById("aiModelName").textContent = "Automatic";
+      document.getElementById("aiModelNote").textContent = ai.trained ? "Monitoring live sensor patterns" : "Learning normal sensor behavior";
       document.getElementById("aiTrainingState").textContent =
-        `${ai.trained_on_samples || 0} / ${ai.min_training_samples || 30}`;
+        ai.trained ? "Ready" : `${ai.trained_on_samples || 0} / ${ai.min_training_samples || 30}`;
       document.getElementById("aiTrainingNote").textContent =
-        `${ai.clean_samples || 0} clean samples stored`;
+        `${ai.clean_samples || 0} normal readings learned`;
       document.getElementById("aiLatestScore").textContent =
-        ai.latest && Number.isFinite(Number(ai.latest.anomaly_score))
-          ? Number(ai.latest.anomaly_score).toFixed(4)
-          : "-";
-      document.getElementById("aiLatestReason").textContent =
-        (ai.latest && ai.latest.anomaly_reason) ||
-        (ai.latest_anomaly && ai.latest_anomaly.reason) ||
-        "No anomaly evaluated yet";
+        ai.latest ? anomalyLevel(ai.latest.anomaly_score, ai.latest.is_anomaly) : "-";
+      document.getElementById("aiLatestReason").textContent = anomalyMessage(ai);
       document.getElementById("aiLastTrained").textContent = formatDateTime(ai.last_trained_at);
       document.getElementById("aiLastScored").textContent =
-        `Last scored: ${formatDateTime(ai.last_scored_at)}`;
+        `Last checked: ${formatDateTime(ai.last_scored_at)}`;
     }
 
     async function refreshStatus() {
@@ -1159,7 +1602,7 @@ def clamp_int(value, default, minimum, maximum):
     return max(minimum, min(maximum, parsed))
 
 
-def normalized_config(payload, current_sensor_count, current_interval_ms):
+def normalized_config(payload, current_sensor_count, current_interval_ms, current_scenario):
     sensor_count = clamp_int(
         payload.get("sensor_count"),
         current_sensor_count,
@@ -1172,7 +1615,10 @@ def normalized_config(payload, current_sensor_count, current_interval_ms):
         10,
         60000,
     )
-    return sensor_count, interval_ms
+    scenario = payload.get("scenario") or current_scenario or "normal"
+    if scenario not in {"normal", "pollution_spike"}:
+        scenario = "normal"
+    return sensor_count, interval_ms, scenario
 
 
 def sensor_id(sensor_number):
@@ -1187,12 +1633,16 @@ def bounded(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
-def generate_reading(sensor_number, now_epoch):
+def generate_reading(sensor_number, now_epoch, scenario="normal"):
     day_fraction = (now_epoch % 86400) / 86400
     daily_wave = math.sin((day_fraction * math.tau) - 1.8)
     local_wave = math.sin((now_epoch / 37) + (sensor_number * 0.19))
     pm2_5 = 24 + (daily_wave * 11) + (local_wave * 4.5) + sensor_bias(sensor_number)
-    pm2_5 = bounded(pm2_5 + random.gauss(0, 1.8), 1.0, 250.0)
+    pm2_5 = pm2_5 + random.gauss(0, 1.8)
+    if scenario == "pollution_spike":
+        spike_wave = math.sin((now_epoch / 9) + (sensor_number * 0.41))
+        pm2_5 += 48 + (spike_wave * 12) + random.gauss(0, 3.5)
+    pm2_5 = bounded(pm2_5, 1.0, 250.0)
     pm1 = bounded(pm2_5 * random.uniform(0.55, 0.75), 0.2, 180.0)
     temperature = 12 + (math.sin((day_fraction * math.tau) - 0.5) * 7)
     humidity = 58 - (math.sin((day_fraction * math.tau) - 0.5) * 16)
@@ -1282,6 +1732,7 @@ def publish_loop(worker_stop_event):
             with state_lock:
                 sensor_count = simulator_state["sensor_count"]
                 interval_ms = simulator_state["interval_ms"]
+                scenario = simulator_state["scenario"]
 
             batch_started = time.perf_counter()
             now_epoch = time.time()
@@ -1292,7 +1743,7 @@ def publish_loop(worker_stop_event):
                 if worker_stop_event.is_set():
                     break
 
-                reading = generate_reading(sensor_number, now_epoch)
+                reading = generate_reading(sensor_number, now_epoch, scenario)
                 payload = json.dumps(reading, separators=(",", ":"))
                 client.publish(TOPIC, payload)
                 published += 1
@@ -1417,6 +1868,59 @@ def get_sensor_timeseries(sensor_id, limit=80):
     return list(reversed(readings))
 
 
+def get_alarm_events(limit=40):
+    safe_limit = max(1, min(int(limit), 100))
+    rows = execute_cassandra(
+        f"""
+        SELECT sensor_id, event_time, notification_channel, event_type, status, pm2_5, location, message
+        FROM {CASSANDRA_KEYSPACE}.{ALARM_EVENTS_TABLE}
+        LIMIT {safe_limit}
+        """
+    )
+    events = [
+        {
+            "sensor_id": row.sensor_id,
+            "event_time": row_timestamp(row.event_time),
+            "notification_channel": row.notification_channel,
+            "event_type": row.event_type,
+            "status": row.status,
+            "pm2_5": row.pm2_5,
+            "location": row.location,
+            "message": row.message,
+        }
+        for row in rows
+    ]
+    return sorted(events, key=lambda item: item["event_time"] or "", reverse=True)
+
+
+def get_anomaly_events(limit=40):
+    safe_limit = max(1, min(int(limit), 100))
+    rows = execute_cassandra(
+        f"""
+        SELECT sensor_id, event_time, anomaly_score, is_anomaly, reason, pm1, pm2_5, relative_humidity, temperature, status, location
+        FROM {CASSANDRA_KEYSPACE}.{ANOMALY_EVENTS_TABLE}
+        LIMIT {safe_limit}
+        """
+    )
+    events = [
+        {
+            "sensor_id": row.sensor_id,
+            "event_time": row_timestamp(row.event_time),
+            "anomaly_score": row.anomaly_score,
+            "is_anomaly": row.is_anomaly,
+            "reason": row.reason,
+            "pm1": row.pm1,
+            "pm2_5": row.pm2_5,
+            "relative_humidity": row.relative_humidity,
+            "temperature": row.temperature,
+            "status": row.status,
+            "location": row.location,
+        }
+        for row in rows
+    ]
+    return sorted(events, key=lambda item: item["event_time"] or "", reverse=True)
+
+
 def get_ai_status(sensor_id):
     profile_rows = execute_cassandra(
         f"""
@@ -1494,7 +1998,7 @@ def get_ai_status(sensor_id):
 
     return {
         "sensor_id": sensor_id,
-        "model_name": "Isolation Forest",
+        "model_name": "Smart monitor",
         "status": status,
         "trained": trained,
         "clean_samples": clean_count,
@@ -1539,6 +2043,8 @@ def api_dashboard():
         timeseries = get_sensor_timeseries(sensor_id)
         latest = timeseries[-1] if timeseries else None
         ai_status = get_ai_status(sensor_id)
+        alerts = get_alarm_events()
+        anomalies = get_anomaly_events()
         return jsonify(
             {
                 "sensor_id": sensor_id,
@@ -1546,6 +2052,8 @@ def api_dashboard():
                 "timeseries": timeseries,
                 "latest": latest,
                 "ai_status": ai_status,
+                "alerts": alerts,
+                "anomalies": anomalies,
                 "error": None,
             }
         )
@@ -1557,6 +2065,8 @@ def api_dashboard():
                 "timeseries": [],
                 "latest": None,
                 "ai_status": None,
+                "alerts": [],
+                "anomalies": [],
                 "error": f"Cassandra dashboard data unavailable: {exc}",
             }
         )
@@ -1575,7 +2085,7 @@ def api_ai_status():
         return jsonify(
             {
                 "sensor_id": requested_sensor_id,
-                "model_name": "Isolation Forest",
+                "model_name": "Smart monitor",
                 "status": "Unavailable",
                 "trained": False,
                 "clean_samples": 0,
@@ -1586,7 +2096,7 @@ def api_ai_status():
                 "last_scored_at": None,
                 "latest": None,
                 "latest_anomaly": None,
-                "error": f"AI status unavailable: {exc}",
+                "error": f"Smart monitor unavailable: {exc}",
             }
         )
 
@@ -1595,13 +2105,15 @@ def api_ai_status():
 def api_config():
     payload = request.get_json(silent=True) or {}
     with state_lock:
-        sensor_count, interval_ms = normalized_config(
+        sensor_count, interval_ms, scenario = normalized_config(
             payload,
             simulator_state["sensor_count"],
             simulator_state["interval_ms"],
+            simulator_state["scenario"],
         )
         simulator_state["sensor_count"] = sensor_count
         simulator_state["interval_ms"] = interval_ms
+        simulator_state["scenario"] = scenario
         simulator_state["last_error"] = None
 
     return jsonify(status_snapshot())
@@ -1615,13 +2127,15 @@ def api_start():
     payload = request.get_json(silent=True) or {}
     already_running = False
     with state_lock:
-        sensor_count, interval_ms = normalized_config(
+        sensor_count, interval_ms, scenario = normalized_config(
             payload,
             simulator_state["sensor_count"],
             simulator_state["interval_ms"],
+            simulator_state["scenario"],
         )
         simulator_state["sensor_count"] = sensor_count
         simulator_state["interval_ms"] = interval_ms
+        simulator_state["scenario"] = scenario
         simulator_state["last_error"] = None
 
         if simulator_state["running"]:

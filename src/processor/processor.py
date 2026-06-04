@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cassandra.cluster import Cluster
 from pyspark.sql import SparkSession
@@ -64,6 +64,16 @@ class TrainedAnomalyModel:
     pipeline: Pipeline
     trained_on_samples: int
     trained_at: datetime
+
+
+SensorMetadataKey = Tuple[
+    Optional[str],
+    Optional[str],
+    Optional[str],
+    Optional[float],
+    Optional[float],
+    Optional[str],
+]
 
 
 def feature_vector(row) -> List[float]:
@@ -386,23 +396,18 @@ measurements_df = (
         "temperature",
         "status",
         "location",
+        col("sensor").getField("type").alias("sensor_type"),
+        col("sensor").getField("firmware").alias("firmware"),
+        col("sensor").getField("latitude").alias("latitude"),
+        col("sensor").getField("longitude").alias("longitude"),
+        col("sensor").getField("unit").alias("unit"),
     )
-)
-
-sensor_metadata_df = structured_df.select(
-    "sensor_id",
-    col("sensor").getField("type").alias("sensor_type"),
-    col("sensor").getField("firmware").alias("firmware"),
-    col("sensor").getField("location").alias("location"),
-    col("sensor").getField("latitude").alias("latitude"),
-    col("sensor").getField("longitude").alias("longitude"),
-    col("sensor").getField("unit").alias("unit"),
-    col("timestamp").alias("updated_at"),
 )
 
 notifier = AlarmNotifier(session=session, keyspace=CASSANDRA_KEYSPACE, logger=LOGGER)
 
 _model_cache: Dict[str, TrainedAnomalyModel] = {}
+_sensor_metadata_cache: Dict[str, SensorMetadataKey] = {}
 
 _select_anomaly_profile = session.prepare(
     f"""
@@ -447,6 +452,13 @@ _insert_measurement = session.prepare(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 )
+_upsert_sensor_metadata = session.prepare(
+    f"""
+    INSERT INTO {CASSANDRA_KEYSPACE}.{SENSOR_METADATA_TABLE}
+    (sensor_id, sensor_type, firmware, location, latitude, longitude, unit, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+)
 
 
 def build_profile(row) -> SensorAnomalyProfile:
@@ -478,6 +490,59 @@ def persist_profile(sensor_id: str, profile: SensorAnomalyProfile, updated_at: d
             updated_at,
         ],
     )
+
+
+def sensor_metadata_key(row) -> SensorMetadataKey:
+    return (
+        row["sensor_type"],
+        row["firmware"],
+        row["location"],
+        row["latitude"],
+        row["longitude"],
+        row["unit"],
+    )
+
+
+def upsert_sensor_metadata_if_changed(row) -> None:
+    sensor_id = row["sensor_id"]
+    metadata_key = sensor_metadata_key(row)
+    if _sensor_metadata_cache.get(sensor_id) == metadata_key:
+        return
+
+    session.execute(
+        _upsert_sensor_metadata,
+        [
+            sensor_id,
+            row["sensor_type"],
+            row["firmware"],
+            row["location"],
+            row["latitude"],
+            row["longitude"],
+            row["unit"],
+            row["timestamp"],
+        ],
+    )
+    _sensor_metadata_cache[sensor_id] = metadata_key
+
+
+def load_sensor_metadata_cache() -> None:
+    rows = session.execute(
+        f"""
+        SELECT sensor_id, sensor_type, firmware, location, latitude, longitude, unit
+        FROM {CASSANDRA_KEYSPACE}.{SENSOR_METADATA_TABLE}
+        LIMIT 10000
+        """
+    )
+    for row in rows:
+        _sensor_metadata_cache[row.sensor_id] = (
+            row.sensor_type,
+            row.firmware,
+            row.location,
+            row.latitude,
+            row.longitude,
+            row.unit,
+        )
+    LOGGER.info("Loaded %s sensor metadata records into memory cache", len(_sensor_metadata_cache))
 
 
 def load_training_samples(sensor_id: str) -> List[List[float]]:
@@ -591,6 +656,7 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
         try:
             sensor_id = row["sensor_id"]
             timestamp = row["timestamp"]
+            upsert_sensor_metadata_if_changed(row)
             profile = load_profile(sensor_id)
             anomaly = score_with_model(sensor_id, row, profile)
 
@@ -668,14 +734,7 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
             )
 
 
-metadata_query = (
-    sensor_metadata_df.writeStream.format("org.apache.spark.sql.cassandra")
-    .option("keyspace", CASSANDRA_KEYSPACE)
-    .option("table", SENSOR_METADATA_TABLE)
-    .option("checkpointLocation", "/tmp/spark_checkpoint/sensor-metadata")
-    .outputMode("append")
-    .start()
-)
+load_sensor_metadata_cache()
 
 measurements_query = (
     measurements_df.writeStream.foreachBatch(process_measurement_batch)
