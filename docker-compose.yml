@@ -119,6 +119,7 @@ services:
       - SIMULATOR_UI_PORT=5000
       - SIMULATOR_SENSOR_COUNT=3
       - SIMULATOR_INTERVAL_MS=1000
+      - SIMULATOR_PUBLISH_WORKERS=8
       - CASSANDRA_HOST=cassandra
       - CASSANDRA_KEYSPACE=air_quality
       - CASSANDRA_TABLE=air_quality

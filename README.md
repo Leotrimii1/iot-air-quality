@@ -232,6 +232,94 @@ Procesi eshte:
 
 Per nivel projekti/enterprise demo, ky kombinim eshte i mire: rregullat e PM2.5 jane te shpjegueshme, ndersa AI kap sjellje te pazakonta qe nuk duken vetem me prag statik. Per nje sistem enterprise te plote do te shtoheshin edhe model versioning, monitorim i drift-it, alert topic ne Kafka per integrime te jashtme dhe ruajtje e metrikave te performances se modelit.
 
+## Analiza e Performances dhe Optimizimit
+
+Per performance nuk testohet vetem nese aplikacioni starton, por sa matje mund t'i dergoje sistemi dhe sa prej tyre arrijne deri te ruajtja pas perpunimit. Projekti perfshin tab-in `Performance` brenda aplikacionit ne `http://localhost:5001`, ku testet nisen me butona dhe rezultatet shfaqen live.
+
+Testet e rekomanduara:
+
+| Testi | Konfigurimi | Qellimi |
+| --- | --- | --- |
+| `smoke` | 3 sensore, 1000 ms, 30 sekonda | Kontrollon nese pipeline punon end-to-end. |
+| `low-load` | 10 sensore, 2000 ms, 60 sekonda | Baseline realist dhe i lehte. Kjo jep rreth 5 matje/sec. |
+| `medium-load` | 100 sensore, 1000 ms, 60 sekonda | Ngarkese normale per demostrim qyteti. |
+| `sustained-stress` | 500 sensore, 100 ms, 60 sekonda | Ngarkese e larte e qendrueshme, rreth 5,000 matje/sec. |
+| `stress` | 1000 sensore, 100 ms, 60 sekonda | Peak stress test, target rreth 10,000 matje/sec. |
+| `alarm-spike` | 10 sensore, 1000 ms, 60 sekonda, pollution spike | Teston rrugen e anomalive dhe alarmeve. |
+
+Ekzekutimi:
+
+1. Hap aplikacionin:
+
+```text
+http://localhost:5001
+```
+
+2. Hape tab-in `Performance`.
+3. Zgjedh testin, p.sh. `Smoke test`, `Low load`, `Medium load`, `Stress test` ose `Alarm spike`.
+4. Shiko live metrikat: target rate, real rate, mesazhet e publikuara dhe batch max.
+
+Per testim teknik nga terminali mund te perdoret edhe script-i:
+
+```powershell
+python scripts/performance_test.py smoke
+python scripts/performance_test.py low-load
+python scripts/performance_test.py medium-load
+python scripts/performance_test.py sustained-stress
+python scripts/performance_test.py alarm-spike
+python scripts/performance_test.py stress --duration 120
+```
+
+Rezultatet ruhen lokalisht ne `performance_results.csv`. Ky file nuk futet ne Git sepse eshte rezultat lokal i matjeve.
+
+Metrikat kryesore qe duhet te analizohen:
+
+- `target_rate_per_sec`: sa matje/sec synon simulatori sipas numrit te sensoreve dhe frekuences.
+- `actual_publish_rate_per_sec`: sa matje/sec realisht publikoi simulatori.
+- `published_messages`: sa mesazhe u publikuan gjate testit.
+- `avg_batch_duration_ms` dhe `max_batch_duration_ms`: sa kohe i duhet simulatorit per te gjeneruar/publikuar nje batch.
+
+Pse jane zgjedhur keto vlera:
+
+- `3 sensore / 1000 ms` eshte smoke test minimal, i lehte per te dalluar gabime bazike.
+- `10 sensore / 2000 ms` eshte baseline i qete: pak trafik, por mjaftueshem per te pare rrjedhen end-to-end.
+- `100 sensore / 1000 ms` perfaqeson ngarkese normale demonstrimi per nje zone qyteti.
+- `500 sensore / 100 ms` teston ngarkese te larte por ende realiste per nje makine lokale.
+- `1000 sensore / 100 ms` eshte peak stress test. Ky nuk pritet gjithmone te jete stabil ne cdo laptop; perdoret per te gjetur kufirin e sistemit.
+- `alarm-spike` ekziston vecmas sepse performance duhet te testohet edhe kur aktivizohen anomalite dhe alarmet, jo vetem kur vlerat jane normale.
+
+Interpretimi:
+
+- Nese `actual_publish_rate_per_sec` eshte afer `target_rate_per_sec`, simulatori po e mban ngarkesen.
+- Nese `max_batch_duration_ms` afrohet ose kalon `interval_ms`, simulatori nuk po arrin ta mbaje ritmin.
+- Nese `published_messages` rritet, por dashboard-i ose Cassandra nuk rifreskohen, ngushtica eshte pas simulatorit: bridge, Kafka, Spark ose Cassandra.
+- Nese `alarm-spike` krijon rreshta ne `anomaly_events` dhe `alarm_events`, atehere rruga e AI/anomalive dhe alarmimit po punon edhe nen ngarkese.
+
+Monitorimi gjate testeve:
+
+```powershell
+docker stats
+docker compose logs -f bridge
+docker compose logs -f processor
+docker compose logs -f cassandra
+```
+
+Pikat e optimizimit per version enterprise:
+
+- Simulatori perdor metadata cache per sensoret dhe disa publisher workers paralel kur ngarkesa eshte e larte. Numri i workers kontrollohet me `SIMULATOR_PUBLISH_WORKERS` ne `docker-compose.yml`.
+- Te reduktohet logging ne bridge/procesor kur ngarkesa eshte e larte.
+- Te mos perdoret `collect()` ne Spark per batch-e shume te medha; shkrimi drejt Cassandra duhet te behet me procesim te shperndare/partition-based.
+- Te optimizohet Cassandra me time buckets kur numri i sensoreve dhe historiku rriten shume.
+- Te shmangen query te renda si `COUNT(*)` ne prodhim; ne test perdoret vetem per matje te thjeshte lokale.
+- Te ndahet rruga e alarmeve ne topic/event stream te vecante nese alarmet duhet te integrohen me sisteme te jashtme.
+
+Ku ndryshohen skenaret e testeve:
+
+- Per testet nga GUI: ndrysho `PERFORMANCE_SCENARIOS` ne `src/simulator/simulator.py`.
+- Per tekstin e kartave ne GUI: ndrysho listen `performanceScenarios` ne `src/simulator/simulator.py`.
+- Per testet nga terminali: ndrysho `SCENARIOS` ne `scripts/performance_test.py`.
+- Per numrin e publisher workers ne stress test: ndrysho `SIMULATOR_PUBLISH_WORKERS` ne `docker-compose.yml`.
+
 ## Ekzekutimi
 
 Nga folderi i projektit, ekzekuto:

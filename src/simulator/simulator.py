@@ -6,6 +6,7 @@ import random
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
@@ -31,6 +32,7 @@ ANOMALY_PROFILE_TABLE = os.getenv("ANOMALY_PROFILE_TABLE", "sensor_ai_profiles")
 TRAINING_SAMPLE_TABLE = os.getenv("TRAINING_SAMPLE_TABLE", "sensor_ai_samples")
 MIN_TRAINING_SAMPLES = int(os.getenv("AI_MODEL_MIN_TRAINING_SAMPLES", "30"))
 MODEL_WINDOW_SIZE = int(os.getenv("AI_MODEL_WINDOW_SIZE", "200"))
+SIMULATOR_PUBLISH_WORKERS = int(os.getenv("SIMULATOR_PUBLISH_WORKERS", "4"))
 
 LOCATION = os.getenv("SIMULATOR_LOCATION", "Prishtina, Kosovo")
 BASE_LATITUDE = float(os.getenv("SIMULATOR_LATITUDE", "42.670917"))
@@ -42,8 +44,11 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 state_lock = threading.Lock()
 cassandra_lock = threading.Lock()
+sensor_profile_lock = threading.RLock()
 cassandra_cluster = None
 cassandra_session = None
+sensor_profiles = {}
+sensor_json_profiles = {}
 stop_event = threading.Event()
 publisher_thread = None
 simulator_state = {
@@ -54,10 +59,64 @@ simulator_state = {
     "total_published": 0,
     "last_batch_count": 0,
     "last_batch_duration_ms": 0,
+    "publish_workers": 1,
     "started_at": None,
     "client_state": "stopped",
     "last_error": None,
     "live_readings": [],
+}
+performance_lock = threading.Lock()
+performance_stop_event = threading.Event()
+performance_thread = None
+performance_state = {
+    "running": False,
+    "current": None,
+    "results": [],
+}
+
+PERFORMANCE_SCENARIOS = {
+    "smoke": {
+        "sensor_count": 3,
+        "interval_ms": 1000,
+        "duration_seconds": 30,
+        "scenario": "normal",
+        "description": "Basic end-to-end health check",
+    },
+    "low-load": {
+        "sensor_count": 10,
+        "interval_ms": 2000,
+        "duration_seconds": 60,
+        "scenario": "normal",
+        "description": "Light realistic traffic",
+    },
+    "medium-load": {
+        "sensor_count": 100,
+        "interval_ms": 1000,
+        "duration_seconds": 60,
+        "scenario": "normal",
+        "description": "Normal demo load",
+    },
+    "sustained-stress": {
+        "sensor_count": 500,
+        "interval_ms": 100,
+        "duration_seconds": 60,
+        "scenario": "normal",
+        "description": "Sustained high load around 5,000 measurements/sec",
+    },
+    "stress": {
+        "sensor_count": 1000,
+        "interval_ms": 100,
+        "duration_seconds": 60,
+        "scenario": "normal",
+        "description": "High throughput stress test",
+    },
+    "alarm-spike": {
+        "sensor_count": 10,
+        "interval_ms": 1000,
+        "duration_seconds": 60,
+        "scenario": "pollution_spike",
+        "description": "Alarm and anomaly path test",
+    },
 }
 
 
@@ -234,6 +293,11 @@ INDEX_HTML = """
       font-weight: 720;
       letter-spacing: 0;
       cursor: pointer;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
     }
 
     button.primary {
@@ -525,7 +589,7 @@ INDEX_HTML = """
 
     .tabbar {
       display: inline-grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr 1fr 1fr;
       gap: 6px;
       margin-bottom: 18px;
       padding: 5px;
@@ -797,8 +861,89 @@ INDEX_HTML = """
       white-space: nowrap;
     }
 
+    .performance-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .scenario-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .scenario-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+    }
+
+    .scenario-card h3 {
+      margin: 0;
+      color: var(--ink);
+      font-size: 15px;
+      line-height: 1.2;
+    }
+
+    .scenario-card p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .scenario-card button {
+      min-width: 96px;
+      padding: 0 12px;
+    }
+
+    .progress-track {
+      height: 12px;
+      border-radius: 8px;
+      background: #dbeafe;
+      overflow: hidden;
+      margin: 14px 0 10px;
+    }
+
+    .progress-fill {
+      width: 0%;
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent) 0%, #38bdf8 100%);
+      transition: width 250ms ease;
+    }
+
+    .result-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .result-table th,
+    .result-table td {
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .result-table th {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+
     @media (max-width: 900px) {
       .layout {
+        grid-template-columns: 1fr;
+      }
+
+      .performance-layout {
         grid-template-columns: 1fr;
       }
 
@@ -897,6 +1042,7 @@ INDEX_HTML = """
     <div class="tabbar">
       <button id="simulatorTab" class="tab-button active" type="button">Simulator</button>
       <button id="dashboardTab" class="tab-button" type="button">Dashboard</button>
+      <button id="performanceTab" class="tab-button" type="button">Performance</button>
     </div>
 
     <div id="simulatorView" class="view active">
@@ -1024,6 +1170,83 @@ INDEX_HTML = """
         <div id="emptyState" class="empty">Nuk ka matje aktive.</div>
       </section>
     </div>
+    </div>
+
+    <div id="performanceView" class="view">
+      <div class="metrics">
+        <div class="metric">
+          <p class="metric-label">Testi aktiv</p>
+          <p id="perfActiveScenario" class="metric-value">-</p>
+          <p class="metric-note">skenari i zgjedhur</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Target</p>
+          <p id="perfTargetRate" class="metric-value">0</p>
+          <p class="metric-note">matje/sec</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Real</p>
+          <p id="perfActualRate" class="metric-value">0</p>
+          <p class="metric-note">matje/sec</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Publikuar</p>
+          <p id="perfPublishedTotal" class="metric-value">0</p>
+          <p class="metric-note">mesazhe</p>
+        </div>
+      </div>
+
+      <div class="performance-layout">
+        <section class="panel">
+          <div class="live-header">
+            <h2 class="panel-title">Performance Lab</h2>
+          </div>
+          <div id="performanceScenarios" class="scenario-list"></div>
+          <button id="stopPerformanceButton" class="ghost" type="button">Ndalo testin</button>
+        </section>
+
+        <section class="panel">
+          <div class="live-header">
+            <h2 class="panel-title">Rezultati live</h2>
+            <span id="perfRemaining" class="live-count">-</span>
+          </div>
+          <div class="progress-track">
+            <div id="perfProgress" class="progress-fill"></div>
+          </div>
+          <div class="reading-detail-grid">
+            <div class="detail-card">
+              <p>Sensorë</p>
+              <strong id="perfSensorCount">-</strong>
+            </div>
+            <div class="detail-card">
+              <p>Intervali</p>
+              <strong id="perfInterval">-</strong>
+            </div>
+            <div class="detail-card">
+              <p>Publikuar</p>
+              <strong id="perfPublished">0</strong>
+            </div>
+            <div class="detail-card">
+              <p>Batch max</p>
+              <strong id="perfMaxBatch">0 ms</strong>
+            </div>
+          </div>
+          <div class="table-scroll" style="margin-top: 18px;">
+            <table class="result-table">
+              <thead>
+                <tr>
+                  <th>Testi</th>
+                  <th>Target</th>
+                  <th>Real</th>
+                  <th>Publikuar</th>
+                  <th>Batch max</th>
+                </tr>
+              </thead>
+              <tbody id="performanceResultsBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
     </div>
 
     <div id="dashboardView" class="view">
@@ -1213,9 +1436,44 @@ INDEX_HTML = """
     const emptyState = document.getElementById("emptyState");
     const simulatorTab = document.getElementById("simulatorTab");
     const dashboardTab = document.getElementById("dashboardTab");
+    const performanceTab = document.getElementById("performanceTab");
     const simulatorView = document.getElementById("simulatorView");
     const dashboardView = document.getElementById("dashboardView");
+    const performanceView = document.getElementById("performanceView");
     let activeDashboardSensor = "airgradient_prishtina_001";
+
+    const performanceScenarios = [
+      {
+        name: "smoke",
+        title: "Smoke test",
+        description: "3 sensore, 1000 ms, kontroll i shpejte end-to-end.",
+      },
+      {
+        name: "low-load",
+        title: "Low load",
+        description: "10 sensore, 2000 ms, rreth 5 matje/sec.",
+      },
+      {
+        name: "medium-load",
+        title: "Medium load",
+        description: "100 sensore, 1000 ms, ngarkese normale demonstrimi.",
+      },
+      {
+        name: "sustained-stress",
+        title: "Sustained stress",
+        description: "500 sensore, 100 ms, rreth 5,000 matje/sec.",
+      },
+      {
+        name: "stress",
+        title: "Stress test",
+        description: "1000 sensore, 100 ms, target rreth 10,000 matje/sec.",
+      },
+      {
+        name: "alarm-spike",
+        title: "Alarm spike",
+        description: "Ndotje e larte per te testuar anomalite dhe alarmet.",
+      },
+    ];
 
     function numberValue(input, fallback) {
       const parsed = Number.parseInt(input.value, 10);
@@ -1290,12 +1548,18 @@ INDEX_HTML = """
 
     function setView(viewName) {
       const dashboardActive = viewName === "dashboard";
-      simulatorTab.classList.toggle("active", !dashboardActive);
+      const performanceActive = viewName === "performance";
+      simulatorTab.classList.toggle("active", viewName === "simulator");
       dashboardTab.classList.toggle("active", dashboardActive);
-      simulatorView.classList.toggle("active", !dashboardActive);
+      performanceTab.classList.toggle("active", performanceActive);
+      simulatorView.classList.toggle("active", viewName === "simulator");
       dashboardView.classList.toggle("active", dashboardActive);
+      performanceView.classList.toggle("active", performanceActive);
       if (dashboardActive) {
         refreshDashboard().catch((error) => showError(error.message));
+      }
+      if (performanceActive) {
+        refreshPerformance().catch((error) => showError(error.message));
       }
     }
 
@@ -1548,6 +1812,62 @@ INDEX_HTML = """
         `Last checked: ${formatDateTime(ai.last_scored_at)}`;
     }
 
+    function renderPerformanceScenarios() {
+      const container = document.getElementById("performanceScenarios");
+      container.innerHTML = "";
+      performanceScenarios.forEach((item) => {
+        const card = document.createElement("div");
+        card.className = "scenario-card";
+        card.innerHTML = `
+          <div>
+            <h3>${escapeHtml(item.title)}</h3>
+            <p>${escapeHtml(item.description)}</p>
+          </div>
+          <button class="primary" type="button" data-scenario="${escapeHtml(item.name)}">Start</button>
+        `;
+        card.querySelector("button").addEventListener("click", () => {
+          startPerformance(item.name).catch((error) => showError(error.message));
+        });
+        container.appendChild(card);
+      });
+    }
+
+    function renderPerformance(data) {
+      const current = data.current || {};
+      const running = Boolean(current.running);
+      const activeName = current.scenario_name || "-";
+      document.getElementById("perfActiveScenario").textContent = activeName;
+      document.getElementById("perfTargetRate").textContent = formatNumber(current.target_rate_per_sec || 0);
+      document.getElementById("perfActualRate").textContent = Number(current.actual_rate_per_sec || 0).toFixed(1);
+      document.getElementById("perfPublishedTotal").textContent = formatNumber(current.published_messages || 0);
+      document.getElementById("perfRemaining").textContent = running
+        ? `${Math.max(0, Math.ceil(current.remaining_seconds || 0))} sekonda`
+        : "testi i fundit";
+      document.getElementById("perfProgress").style.width = `${Math.max(0, Math.min(100, current.progress_percent || 0))}%`;
+      document.getElementById("perfSensorCount").textContent = current.sensor_count || "-";
+      document.getElementById("perfInterval").textContent = current.interval_ms ? `${current.interval_ms} ms` : "-";
+      document.getElementById("perfPublished").textContent = formatNumber(current.published_messages || 0);
+      document.getElementById("perfMaxBatch").textContent = `${Number(current.max_batch_duration_ms || 0).toFixed(1)} ms`;
+      document.getElementById("stopPerformanceButton").disabled = !running;
+      document.querySelectorAll("[data-scenario]").forEach((button) => {
+        button.disabled = running;
+      });
+
+      const resultsBody = document.getElementById("performanceResultsBody");
+      resultsBody.innerHTML = "";
+      (data.results || []).forEach((result) => {
+        const row = document.createElement("tr");
+        row.innerHTML = `
+          <td>${escapeHtml(result.scenario_name)}</td>
+          <td>${formatNumber(result.target_rate_per_sec || 0)}</td>
+          <td>${Number(result.actual_publish_rate_per_sec || 0).toFixed(1)}</td>
+          <td>${formatNumber(result.published_messages || 0)}</td>
+          <td>${Number(result.max_batch_duration_ms || 0).toFixed(1)} ms</td>
+        `;
+        resultsBody.appendChild(row);
+      });
+    }
+
     async function refreshStatus() {
       const response = await fetch("/api/status");
       renderStatus(await response.json());
@@ -1559,6 +1879,26 @@ INDEX_HTML = """
         throw new Error(await response.text());
       }
       renderDashboard(await response.json());
+    }
+
+    async function refreshPerformance() {
+      const response = await fetch("/api/performance/status");
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      renderPerformance(await response.json());
+    }
+
+    async function startPerformance(name) {
+      const response = await postJson("/api/performance/start", { scenario_name: name });
+      renderPerformance(response);
+      showError("");
+    }
+
+    async function stopPerformance() {
+      const response = await postJson("/api/performance/stop", {});
+      renderPerformance(response);
+      showError("");
     }
 
     document.getElementById("startButton").addEventListener("click", () => {
@@ -1575,19 +1915,30 @@ INDEX_HTML = """
     });
     simulatorTab.addEventListener("click", () => setView("simulator"));
     dashboardTab.addEventListener("click", () => setView("dashboard"));
+    performanceTab.addEventListener("click", () => setView("performance"));
+    document.getElementById("stopPerformanceButton").addEventListener("click", () => {
+      stopPerformance().catch((error) => showError(error.message));
+    });
     window.addEventListener("resize", () => {
       if (dashboardView.classList.contains("active")) {
         refreshDashboard().catch((error) => showError(error.message));
       }
     });
 
+    renderPerformanceScenarios();
     refreshStatus().catch((error) => showError(error.message));
+    refreshPerformance().catch((error) => showError(error.message));
     setInterval(() => refreshStatus().catch((error) => showError(error.message)), 600);
     setInterval(() => {
       if (dashboardView.classList.contains("active")) {
         refreshDashboard().catch((error) => showError(error.message));
       }
     }, 2500);
+    setInterval(() => {
+      if (performanceView.classList.contains("active")) {
+        refreshPerformance().catch((error) => showError(error.message));
+      }
+    }, 1000);
   </script>
 </body>
 </html>
@@ -1629,11 +1980,37 @@ def sensor_bias(sensor_number):
     return (((sensor_number * 37) % 21) - 10) * 0.65
 
 
+def sensor_profile(sensor_number):
+    with sensor_profile_lock:
+        profile = sensor_profiles.get(sensor_number)
+        if profile is None:
+            profile = {
+                "id": sensor_id(sensor_number),
+                "type": "AirGradient PM Simulator",
+                "firmware": "sim-1.0",
+                "location": LOCATION,
+                "latitude": round(BASE_LATITUDE + ((sensor_number % 17) - 8) * 0.00025, 6),
+                "longitude": round(BASE_LONGITUDE + ((sensor_number % 19) - 9) * 0.00025, 6),
+                "unit": "ug/m3",
+            }
+            sensor_profiles[sensor_number] = profile
+        return profile
+
+
+def sensor_profile_json(sensor_number):
+    with sensor_profile_lock:
+        profile_json = sensor_json_profiles.get(sensor_number)
+        if profile_json is None:
+            profile_json = json.dumps(sensor_profile(sensor_number), separators=(",", ":"))
+            sensor_json_profiles[sensor_number] = profile_json
+        return profile_json
+
+
 def bounded(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
-def generate_reading(sensor_number, now_epoch, scenario="normal"):
+def generate_measurement_values(sensor_number, now_epoch, scenario="normal"):
     day_fraction = (now_epoch % 86400) / 86400
     daily_wave = math.sin((day_fraction * math.tau) - 1.8)
     local_wave = math.sin((now_epoch / 37) + (sensor_number * 0.19))
@@ -1646,30 +2023,30 @@ def generate_reading(sensor_number, now_epoch, scenario="normal"):
     pm1 = bounded(pm2_5 * random.uniform(0.55, 0.75), 0.2, 180.0)
     temperature = 12 + (math.sin((day_fraction * math.tau) - 0.5) * 7)
     humidity = 58 - (math.sin((day_fraction * math.tau) - 0.5) * 16)
+    relative_humidity = bounded(humidity + random.gauss(0, 2.2), 15, 95)
+    temperature = temperature + random.gauss(0, 0.7)
+    um003 = pm2_5 * random.uniform(120, 180)
+    return pm1, pm2_5, relative_humidity, temperature, um003
 
-    sensor_identifier = sensor_id(sensor_number)
+
+def generate_reading(sensor_number, now_epoch, scenario="normal", timestamp_iso=None, message_prefix=None):
+    pm1, pm2_5, relative_humidity, temperature, um003 = generate_measurement_values(
+        sensor_number,
+        now_epoch,
+        scenario,
+    )
+    profile = sensor_profile(sensor_number)
 
     return {
-        "message_id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "sensor": {
-            "id": sensor_identifier,
-            "type": "AirGradient PM Simulator",
-            "firmware": "sim-1.0",
-            "location": LOCATION,
-            "latitude": round(BASE_LATITUDE + ((sensor_number % 17) - 8) * 0.00025, 6),
-            "longitude": round(BASE_LONGITUDE + ((sensor_number % 19) - 9) * 0.00025, 6),
-            "unit": "ug/m3",
-        },
+        "message_id": f"{message_prefix}-{sensor_number:05d}" if message_prefix else str(uuid.uuid4()),
+        "timestamp": timestamp_iso or datetime.now(timezone.utc).isoformat(),
+        "sensor": profile,
         "measurements": {
             "pm1": round(pm1, 3),
             "pm2.5": round(pm2_5, 3),
-            "relative_humidity": round(
-                bounded(humidity + random.gauss(0, 2.2), 15, 95),
-                2,
-            ),
-            "temperature": round(temperature + random.gauss(0, 0.7), 2),
-            "um003": round(pm2_5 * random.uniform(120, 180), 2),
+            "relative_humidity": round(relative_humidity, 2),
+            "temperature": round(temperature, 2),
+            "um003": round(um003, 2),
         },
         "health": {
             "battery": round(random.uniform(82, 100), 1),
@@ -1696,8 +2073,17 @@ def on_disconnect(client, userdata, rc):
         set_state(client_state="disconnected", last_error="MQTT connection lost")
 
 
+def publish_worker_count(sensor_count, interval_ms):
+    target_rate = sensor_count * (1000 / interval_ms)
+    if target_rate <= 10000:
+        return 1
+    return max(1, min(SIMULATOR_PUBLISH_WORKERS, math.ceil(target_rate / 2500)))
+
+
 def connect_mqtt(worker_stop_event):
     client = mqtt.Client()
+    client.max_inflight_messages_set(10000)
+    client.max_queued_messages_set(0)
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
 
@@ -1716,62 +2102,143 @@ def connect_mqtt(worker_stop_event):
     return None
 
 
+def publish_sensor_range(
+    client,
+    sensor_start,
+    sensor_end,
+    now_epoch,
+    scenario,
+    timestamp_iso,
+    message_prefix,
+    live_limit,
+):
+    live_readings = []
+    published = 0
+
+    for sensor_number in range(sensor_start, sensor_end):
+        payload, pm1, pm2_5 = generate_payload(
+            sensor_number,
+            now_epoch,
+            scenario,
+            timestamp_iso,
+            message_prefix,
+        )
+        client.publish(TOPIC, payload)
+        published += 1
+
+        if len(live_readings) < live_limit:
+            live_readings.append(
+                {
+                    "sensor_number": sensor_number,
+                    "sensor_id": sensor_id(sensor_number),
+                    "pm1": round(pm1, 3),
+                    "pm2_5": round(pm2_5, 3),
+                    "timestamp": timestamp_iso,
+                }
+            )
+
+    return published, live_readings
+
+
 def publish_loop(worker_stop_event):
     global stop_event
 
-    client = connect_mqtt(worker_stop_event)
-    if client is None:
+    clients = []
+    initial_client = connect_mqtt(worker_stop_event)
+    if initial_client is None:
         if worker_stop_event is stop_event:
             set_state(running=False, client_state="stopped")
         return
+    clients.append(initial_client)
 
-    client.loop_start()
+    for client in clients:
+        client.loop_start()
 
     try:
+        executor = None
         while not worker_stop_event.is_set():
             with state_lock:
                 sensor_count = simulator_state["sensor_count"]
                 interval_ms = simulator_state["interval_ms"]
                 scenario = simulator_state["scenario"]
 
+            worker_count = publish_worker_count(sensor_count, interval_ms)
+            while len(clients) < worker_count and not worker_stop_event.is_set():
+                extra_client = connect_mqtt(worker_stop_event)
+                if extra_client is None:
+                    break
+                extra_client.loop_start()
+                clients.append(extra_client)
+
+            active_clients = clients[:worker_count]
+            if worker_count > 1 and (executor is None or executor._max_workers != worker_count):
+                if executor is not None:
+                    executor.shutdown(wait=True)
+                executor = ThreadPoolExecutor(max_workers=worker_count)
+
             batch_started = time.perf_counter()
             now_epoch = time.time()
+            timestamp_iso = datetime.now(timezone.utc).isoformat()
+            message_prefix = uuid.uuid4().hex
             live_readings = []
             published = 0
 
-            for sensor_number in range(1, sensor_count + 1):
-                if worker_stop_event.is_set():
-                    break
-
-                reading = generate_reading(sensor_number, now_epoch, scenario)
-                payload = json.dumps(reading, separators=(",", ":"))
-                client.publish(TOPIC, payload)
-                published += 1
-
-                if len(live_readings) < MAX_LIVE_READINGS:
-                    live_readings.append(
-                        {
-                            "sensor_number": sensor_number,
-                            "sensor_id": reading["sensor"]["id"],
-                            "pm1": reading["measurements"]["pm1"],
-                            "pm2_5": reading["measurements"]["pm2.5"],
-                            "timestamp": reading["timestamp"],
-                        }
+            if worker_count == 1:
+                published, live_readings = publish_sensor_range(
+                    active_clients[0],
+                    1,
+                    sensor_count + 1,
+                    now_epoch,
+                    scenario,
+                    timestamp_iso,
+                    message_prefix,
+                    MAX_LIVE_READINGS,
+                )
+            else:
+                chunk_size = math.ceil(sensor_count / worker_count)
+                futures = []
+                for worker_index, client in enumerate(active_clients):
+                    start = (worker_index * chunk_size) + 1
+                    end = min(sensor_count + 1, start + chunk_size)
+                    if start >= end:
+                        continue
+                    futures.append(
+                        executor.submit(
+                            publish_sensor_range,
+                            client,
+                            start,
+                            end,
+                            now_epoch,
+                            scenario,
+                            timestamp_iso,
+                            message_prefix,
+                            max(0, MAX_LIVE_READINGS - len(live_readings)),
+                        )
                     )
+                for future in futures:
+                    chunk_published, chunk_live = future.result()
+                    published += chunk_published
+                    if len(live_readings) < MAX_LIVE_READINGS:
+                        remaining = MAX_LIVE_READINGS - len(live_readings)
+                        live_readings.extend(chunk_live[:remaining])
 
             batch_duration_ms = round((time.perf_counter() - batch_started) * 1000, 2)
             with state_lock:
                 simulator_state["total_published"] += published
                 simulator_state["last_batch_count"] = published
                 simulator_state["last_batch_duration_ms"] = batch_duration_ms
+                simulator_state["publish_workers"] = worker_count
                 simulator_state["live_readings"] = live_readings
 
             delay_seconds = (interval_ms / 1000) - (batch_duration_ms / 1000)
             if delay_seconds > 0:
                 worker_stop_event.wait(delay_seconds)
     finally:
-        client.loop_stop()
-        client.disconnect()
+        if executor is not None:
+            executor.shutdown(wait=False)
+        for client in clients:
+            client.loop_stop()
+            client.disconnect()
         if worker_stop_event is stop_event:
             set_state(running=False, client_state="stopped")
 
@@ -1788,6 +2255,44 @@ def status_snapshot():
     started_at = snapshot.get("started_at")
     snapshot["uptime_seconds"] = round(time.time() - started_at, 1) if started_at else 0
     return snapshot
+
+
+def start_publisher(sensor_count, interval_ms, scenario):
+    global publisher_thread
+    global stop_event
+
+    already_running = False
+    with state_lock:
+        simulator_state["sensor_count"] = sensor_count
+        simulator_state["interval_ms"] = interval_ms
+        simulator_state["scenario"] = scenario
+        simulator_state["last_error"] = None
+
+        if simulator_state["running"]:
+            already_running = True
+        else:
+            stop_event = threading.Event()
+            simulator_state["running"] = True
+            simulator_state["client_state"] = "starting"
+            simulator_state["total_published"] = 0
+            simulator_state["last_batch_count"] = 0
+            simulator_state["last_batch_duration_ms"] = 0
+            simulator_state["publish_workers"] = publish_worker_count(sensor_count, interval_ms)
+            simulator_state["live_readings"] = []
+            simulator_state["started_at"] = time.time()
+
+    if not already_running:
+        publisher_thread = threading.Thread(
+            target=publish_loop,
+            args=(stop_event,),
+            daemon=True,
+        )
+        publisher_thread.start()
+
+
+def stop_publisher():
+    stop_event.set()
+    set_state(running=False, client_state="stopping")
 
 
 def row_timestamp(value):
@@ -1818,6 +2323,114 @@ def execute_cassandra(query, params=None):
             cassandra_cluster = None
             cassandra_session = None
         raise
+
+
+def performance_current_snapshot():
+    with performance_lock:
+        current = dict(performance_state["current"] or {})
+        results = [dict(item) for item in performance_state["results"]]
+
+    if current:
+        current["running"] = bool(current.get("running"))
+        if "started_at" in current:
+            status = status_snapshot()
+            now = time.time()
+            duration = max(now - current["started_at"], 1)
+            published_messages = max(int(status.get("total_published") or 0) - current["start_published"], 0)
+            batch_durations = list(current.get("batch_durations") or [])
+            current["elapsed_seconds"] = round(duration, 1)
+            current["remaining_seconds"] = max(0, round(current["duration_seconds"] - duration, 1))
+            current["progress_percent"] = min(100, round((duration / current["duration_seconds"]) * 100, 1))
+            current["published_messages"] = published_messages
+            current["actual_rate_per_sec"] = round(published_messages / duration, 2)
+            current["target_rate_per_sec"] = round(current["sensor_count"] * (1000 / current["interval_ms"]), 2)
+            current["max_batch_duration_ms"] = max(batch_durations) if batch_durations else float(status.get("last_batch_duration_ms") or 0)
+            current["avg_batch_duration_ms"] = (
+                round(sum(batch_durations) / len(batch_durations), 2)
+                if batch_durations
+                else float(status.get("last_batch_duration_ms") or 0)
+            )
+    else:
+        current = {
+            "running": False,
+            "scenario_name": None,
+            "target_rate_per_sec": 0,
+            "actual_rate_per_sec": 0,
+            "published_messages": 0,
+            "progress_percent": 0,
+            "max_batch_duration_ms": 0,
+        }
+
+    return {"current": current, "results": list(reversed(results[-8:]))}
+
+
+def finish_performance_test():
+    with performance_lock:
+        current = performance_state["current"]
+        if not current or not current.get("running") or "started_at" not in current:
+            return
+        current["running"] = False
+        current["finished_at"] = time.time()
+
+    stop_publisher()
+    snapshot = performance_current_snapshot()["current"]
+    result = {
+        "scenario_name": snapshot.get("scenario_name"),
+        "description": snapshot.get("description"),
+        "sensor_count": snapshot.get("sensor_count"),
+        "interval_ms": snapshot.get("interval_ms"),
+        "duration_seconds": snapshot.get("elapsed_seconds"),
+        "target_rate_per_sec": snapshot.get("target_rate_per_sec"),
+        "actual_publish_rate_per_sec": snapshot.get("actual_rate_per_sec"),
+        "published_messages": snapshot.get("published_messages"),
+        "avg_batch_duration_ms": snapshot.get("avg_batch_duration_ms"),
+        "max_batch_duration_ms": snapshot.get("max_batch_duration_ms"),
+        "scenario": snapshot.get("scenario"),
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with performance_lock:
+        performance_state["results"].append(result)
+        performance_state["current"] = dict(
+            result,
+            running=False,
+            progress_percent=100,
+            remaining_seconds=0,
+            actual_rate_per_sec=result["actual_publish_rate_per_sec"],
+        )
+        performance_state["running"] = False
+
+
+def generate_payload(sensor_number, now_epoch, scenario, timestamp_iso, message_prefix):
+    pm1, pm2_5, relative_humidity, temperature, um003 = generate_measurement_values(
+        sensor_number,
+        now_epoch,
+        scenario,
+    )
+    battery = random.uniform(82, 100)
+    signal = random.randint(-72, -38)
+    message_id = f"{message_prefix}-{sensor_number:05d}"
+    return (
+        f'{{"message_id":"{message_id}",'
+        f'"timestamp":"{timestamp_iso}",'
+        f'"sensor":{sensor_profile_json(sensor_number)},'
+        f'"measurements":{{"pm1":{pm1:.3f},"pm2.5":{pm2_5:.3f},'
+        f'"relative_humidity":{relative_humidity:.2f},'
+        f'"temperature":{temperature:.2f},'
+        f'"um003":{um003:.2f}}},'
+        f'"health":{{"battery":{battery:.1f},"signal":{signal},"status":"online"}}}}'
+    ), pm1, pm2_5
+
+
+def performance_runner(duration_seconds):
+    deadline = time.time() + duration_seconds
+    while time.time() < deadline and not performance_stop_event.is_set():
+        status = status_snapshot()
+        with performance_lock:
+            current = performance_state["current"]
+            if current:
+                current.setdefault("batch_durations", []).append(float(status.get("last_batch_duration_ms") or 0))
+        performance_stop_event.wait(1)
+    finish_performance_test()
 
 
 def get_sensor_metadata():
@@ -2121,11 +2734,7 @@ def api_config():
 
 @app.post("/api/start")
 def api_start():
-    global publisher_thread
-    global stop_event
-
     payload = request.get_json(silent=True) or {}
-    already_running = False
     with state_lock:
         sensor_count, interval_ms, scenario = normalized_config(
             payload,
@@ -2133,40 +2742,70 @@ def api_start():
             simulator_state["interval_ms"],
             simulator_state["scenario"],
         )
-        simulator_state["sensor_count"] = sensor_count
-        simulator_state["interval_ms"] = interval_ms
-        simulator_state["scenario"] = scenario
-        simulator_state["last_error"] = None
-
-        if simulator_state["running"]:
-            already_running = True
-        else:
-            stop_event = threading.Event()
-            simulator_state["running"] = True
-            simulator_state["client_state"] = "starting"
-            simulator_state["total_published"] = 0
-            simulator_state["last_batch_count"] = 0
-            simulator_state["last_batch_duration_ms"] = 0
-            simulator_state["live_readings"] = []
-            simulator_state["started_at"] = time.time()
-
-    if already_running:
-        return jsonify(status_snapshot())
-
-    publisher_thread = threading.Thread(
-        target=publish_loop,
-        args=(stop_event,),
-        daemon=True,
-    )
-    publisher_thread.start()
+    start_publisher(sensor_count, interval_ms, scenario)
     return jsonify(status_snapshot())
 
 
 @app.post("/api/stop")
 def api_stop():
-    stop_event.set()
-    set_state(running=False, client_state="stopping")
+    stop_publisher()
     return jsonify(status_snapshot())
+
+
+@app.get("/api/performance/status")
+def api_performance_status():
+    return jsonify(performance_current_snapshot())
+
+
+@app.post("/api/performance/start")
+def api_performance_start():
+    global performance_thread
+    global performance_stop_event
+
+    payload = request.get_json(silent=True) or {}
+    scenario_name = payload.get("scenario_name") or "smoke"
+    if scenario_name not in PERFORMANCE_SCENARIOS:
+        return jsonify({"error": f"Unknown performance scenario: {scenario_name}"}), 400
+
+    with performance_lock:
+        already_running = performance_state["running"]
+    if already_running:
+        return jsonify(performance_current_snapshot())
+
+    config = PERFORMANCE_SCENARIOS[scenario_name]
+    start_publisher(config["sensor_count"], config["interval_ms"], config["scenario"])
+    start_status = status_snapshot()
+    performance_stop_event = threading.Event()
+    with performance_lock:
+        performance_state["running"] = True
+        performance_state["current"] = {
+            "running": True,
+            "scenario_name": scenario_name,
+            "description": config["description"],
+            "sensor_count": config["sensor_count"],
+            "interval_ms": config["interval_ms"],
+            "duration_seconds": config["duration_seconds"],
+            "scenario": config["scenario"],
+            "started_at": time.time(),
+            "start_published": int(start_status.get("total_published") or 0),
+            "batch_durations": [],
+        }
+
+    performance_thread = threading.Thread(
+        target=performance_runner,
+        args=(config["duration_seconds"],),
+        daemon=True,
+    )
+    performance_thread.start()
+    return jsonify(performance_current_snapshot())
+
+
+@app.post("/api/performance/stop")
+def api_performance_stop():
+    performance_stop_event.set()
+    stop_publisher()
+    finish_performance_test()
+    return jsonify(performance_current_snapshot())
 
 
 if __name__ == "__main__":
