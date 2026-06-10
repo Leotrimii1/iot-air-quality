@@ -47,6 +47,7 @@ Simulatori publikon mesazhe JSON te ketij tipi:
 {
   "message_id": "4f5dd6c5-2b9f-468e-a9a2-806b7efcdbad",
   "timestamp": "2026-06-01T17:30:00.000000+00:00",
+  "published_at": "2026-06-01T17:30:00.000000+00:00",
   "sensor": {
     "id": "airgradient_prishtina_001",
     "type": "AirGradient PM Simulator",
@@ -84,6 +85,17 @@ PM2.5 > 55   -> Very Unhealthy
 
 Klasifikimi nuk ruhet ne CSV dhe nuk vjen i gatshem nga sensori. Procesori krijon/lexon tabelen `quality_ranks` kur starton Spark Streaming, pastaj perdor ato metadata per te llogaritur statusin nga PM2.5.
 
+PM1 ka status te ndare operativ brenda projektit:
+
+```text
+PM1 <= 10  -> Good
+PM1 <= 20  -> Moderate
+PM1 <= 35  -> Unhealthy
+PM1 > 35   -> Very Unhealthy
+```
+
+PM1 nuk perdoret si standard publik AQI ne te njejten menyre si PM2.5, prandaj ne projekt trajtohet si indikator operativ per krahasim dhe monitorim te brendshem.
+
 ## Skema e Cassandra
 
 Procesori krijon automatikisht keto tabela:
@@ -92,10 +104,22 @@ Procesori krijon automatikisht keto tabela:
 CREATE TABLE air_quality.air_quality (
     sensor_id text,
     timestamp timestamp,
+    message_id text,
     pm1 double,
     pm2_5 double,
+    pm1_status text,
+    pm2_5_status text,
     status text,
     location text,
+    published_at timestamp,
+    bridge_received_at timestamp,
+    kafka_sent_at timestamp,
+    processed_at timestamp,
+    stored_at timestamp,
+    latency_ms double,
+    forecast_pm2_5_10m double,
+    forecast_pm2_5_30m double,
+    forecast_pm2_5_60m double,
     anomaly_score double,
     is_anomaly boolean,
     anomaly_reason text,
@@ -122,7 +146,7 @@ CREATE TABLE air_quality.quality_ranks (
 ) WITH CLUSTERING ORDER BY (rank_order ASC);
 ```
 
-Tabela `air_quality` ruan vetem te dhenat e nevojshme per rezultatet operative: `sensor_id`, `timestamp`, `pm1`, `pm2_5`, `status`, `location` dhe fushat e AI-se. Payload-i i plote i sensorit nuk ruhet si raw JSON, sepse `battery`, `signal`, `message_id` dhe fusha te tjera perdoren vetem per transport/simulim dhe nuk jane te nevojshme per query kryesore.
+Tabela `air_quality` ruan vetem te dhenat e nevojshme per rezultatet operative: `sensor_id`, `timestamp`, `pm1`, `pm2_5`, statuset per PM1/PM2.5, `location`, latencen, forecast-et dhe fushat e AI-se. Payload-i i plote i sensorit nuk ruhet si raw JSON, sepse `battery`, `signal` dhe fusha te tjera perdoren vetem per transport/simulim dhe nuk jane te nevojshme per query kryesore.
 
 Metadata e sensorit ruhet ndaras ne `sensor_metadata`: tipi, firmware, lokacioni, koordinatat dhe njesia matese. Procesori i mban keto metadata edhe ne memory cache dhe i shkruan ne Cassandra vetem kur sensori eshte i ri ose metadata ka ndryshuar. Pragjet e klasifikimit ruhen ne `quality_ranks` dhe lexohen kur starton Spark Streaming.
 
@@ -182,9 +206,34 @@ CREATE TABLE air_quality.sensor_ai_samples (
     temperature double,
     PRIMARY KEY (sensor_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
+
+CREATE TABLE air_quality.pm25_forecasts (
+    sensor_id text,
+    forecast_time timestamp,
+    created_at timestamp,
+    horizon_minutes int,
+    forecast_pm2_5 double,
+    last_pm2_5 double,
+    method text,
+    location text,
+    PRIMARY KEY ((sensor_id), forecast_time)
+) WITH CLUSTERING ORDER BY (forecast_time DESC);
+
+CREATE TABLE air_quality.performance_metrics (
+    metric_scope text,
+    recorded_at timestamp,
+    batch_id int,
+    input_rows int,
+    batch_duration_ms double,
+    avg_latency_ms double,
+    p95_latency_ms double,
+    p99_latency_ms double,
+    throughput_rows_per_sec double,
+    PRIMARY KEY ((metric_scope), recorded_at)
+) WITH CLUSTERING ORDER BY (recorded_at DESC);
 ```
 
-Rreshti kalon fillimisht ne motorin e zbulimit te anomalive, pastaj ruhet ne Cassandra bashke me `anomaly_score`, `is_anomaly` dhe `anomaly_reason`. `Isolation Forest` trajnohet ne kohe reale nga mostra te pastra qe ruhen ne `sensor_ai_samples`, ndersa metadata e trajnimit ruhet ne `sensor_ai_profiles`.
+Rreshti kalon fillimisht ne motorin e zbulimit te anomalive, pastaj ruhet ne Cassandra bashke me `anomaly_score`, `is_anomaly`, `anomaly_reason`, latencen end-to-end dhe parashikimin e PM2.5. `Isolation Forest` trajnohet ne kohe reale nga mostra te pastra qe ruhen ne `sensor_ai_samples`, ndersa metadata e trajnimit ruhet ne `sensor_ai_profiles`.
 
 Email alerts dergohen kur statusi kalon pragun `ALERT_EMAIL_MIN_STATUS`. Default-i i projektit eshte `Unhealthy`, sepse `Moderate` prodhon shume njoftime dhe nuk eshte i pershtatshem per alarmim operativ. Duplicate shmangen me cooldown. Recovery email mund te dergohet kur statusi zbret nen pragun e alarmit. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
 
@@ -226,11 +275,12 @@ Procesi eshte:
 - Metadata e sensorit kontrollohet me memory cache dhe ruhet vetem kur eshte e re ose ka ndryshuar.
 - `Isolation Forest` trajnohet per secilin sensor nga mostra te pastra ne `sensor_ai_samples`.
 - Ne realtime, AI e vlereson rreshtin perpara se rreshti final te ruhet ne `air_quality`.
+- Sistemi llogarit forecast te PM2.5 per 10, 30 dhe 60 minutat e ardhshme me median/trend te stabilizuar nga dritarja e fundit e matjeve. Forecast-i shfaqet vetem pasi sensori ka mjaftueshem histori; deri atehere dashboard-i e paraqet si `Learning`.
 - Gjendja e modelit ruhet ne `sensor_ai_profiles`, prandaj dashboard-i mund te tregoje nese modeli eshte ende duke mesuar apo eshte trajnuar.
 - Nese AI zbulon anomali, eventi ruhet ne `anomaly_events`.
 - Alarmet operative perdorin statusin e PM2.5 dhe ruhen ne `alarm_events`; email dergohet vetem nga `Unhealthy` e lart.
 
-Per nivel projekti/enterprise demo, ky kombinim eshte i mire: rregullat e PM2.5 jane te shpjegueshme, ndersa AI kap sjellje te pazakonta qe nuk duken vetem me prag statik. Per nje sistem enterprise te plote do te shtoheshin edhe model versioning, monitorim i drift-it, alert topic ne Kafka per integrime te jashtme dhe ruajtje e metrikave te performances se modelit.
+Per nivel projekti/enterprise demo, ky kombinim eshte i mire: rregullat e PM2.5 jane te shpjegueshme, anomaly detection kap sjellje te pazakonta qe nuk duken vetem me prag statik, ndersa forecast-i jep sinjal paraprak per ndotjen e mundshme. Per nje sistem enterprise te plote do te shtoheshin edhe model versioning, monitorim i drift-it, alert topic ne Kafka per integrime te jashtme dhe ruajtje e metrikave te performances se modelit.
 
 ## Analiza e Performances dhe Optimizimit
 
@@ -278,6 +328,9 @@ Metrikat kryesore qe duhet te analizohen:
 - `actual_publish_rate_per_sec`: sa matje/sec realisht publikoi simulatori.
 - `published_messages`: sa mesazhe u publikuan gjate testit.
 - `avg_batch_duration_ms` dhe `max_batch_duration_ms`: sa kohe i duhet simulatorit per te gjeneruar/publikuar nje batch.
+- `latency_ms`: koha nga publikimi i matjes deri te ruajtja pas perpunimit.
+- `avg_latency_ms`, `p95_latency_ms`, `p99_latency_ms`: latency mesatare dhe percentile per batch-et e Spark.
+- `throughput_rows_per_sec`: sa rreshta/sec po perpunon Spark dhe po i shkruan ne Cassandra.
 
 Pse jane zgjedhur keto vlera:
 
@@ -292,8 +345,9 @@ Interpretimi:
 
 - Nese `actual_publish_rate_per_sec` eshte afer `target_rate_per_sec`, simulatori po e mban ngarkesen.
 - Nese `max_batch_duration_ms` afrohet ose kalon `interval_ms`, simulatori nuk po arrin ta mbaje ritmin.
-- Nese `published_messages` rritet, por dashboard-i ose Cassandra nuk rifreskohen, ngushtica eshte pas simulatorit: bridge, Kafka, Spark ose Cassandra.
+- Nese `published_messages` rritet, por `throughput_rows_per_sec` dhe dashboard-i mbesin prapa, ngushtica eshte pas simulatorit: bridge, Kafka, Spark ose Cassandra.
 - Nese `alarm-spike` krijon rreshta ne `anomaly_events` dhe `alarm_events`, atehere rruga e AI/anomalive dhe alarmimit po punon edhe nen ngarkese.
+- Dashboard-i shfaq `P95 latency`, `Throughput` dhe `PM2.5 pas 10 min` nga tabelat e perpunuara ne Cassandra.
 
 Monitorimi gjate testeve:
 
@@ -307,8 +361,8 @@ docker compose logs -f cassandra
 Pikat e optimizimit per version enterprise:
 
 - Simulatori perdor metadata cache per sensoret dhe disa publisher workers paralel kur ngarkesa eshte e larte. Numri i workers kontrollohet me `SIMULATOR_PUBLISH_WORKERS` ne `docker-compose.yml`.
-- Te reduktohet logging ne bridge/procesor kur ngarkesa eshte e larte.
-- Te mos perdoret `collect()` ne Spark per batch-e shume te medha; shkrimi drejt Cassandra duhet te behet me procesim te shperndare/partition-based.
+- Bridge MQTT-to-Kafka perdor producer asinkron me batching (`linger_ms`, `batch_size`) dhe nuk ben `flush()` per cdo mesazh.
+- Spark nuk perdor me `collect()` per batch-in; rreshtat lexohen me iterator lokal per te ulur presionin ne memory. Arsyeja pse nuk eshte kaluar direkt ne `foreachPartition` eshte se AI profiles, training samples dhe alarm state jane stateful dhe duhet te sinkronizohen me kujdes per te mos krijuar duplicate alerts ose trajnime jo-konsistente. Per shkalle enterprise te plote, hapi tjeter eshte ndarja e AI/notifier ne komponente worker-safe dhe shkrimi me `foreachPartition` ose Spark Cassandra connector.
 - Te optimizohet Cassandra me time buckets kur numri i sensoreve dhe historiku rriten shume.
 - Te shmangen query te renda si `COUNT(*)` ne prodhim; ne test perdoret vetem per matje te thjeshte lokale.
 - Te ndahet rruga e alarmeve ne topic/event stream te vecante nese alarmet duhet te integrohen me sisteme te jashtme.

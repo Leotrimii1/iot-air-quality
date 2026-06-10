@@ -128,6 +128,8 @@ services:
       - ANOMALY_EVENTS_TABLE=anomaly_events
       - ANOMALY_PROFILE_TABLE=sensor_ai_profiles
       - TRAINING_SAMPLE_TABLE=sensor_ai_samples
+      - FORECAST_TABLE=pm25_forecasts
+      - PERFORMANCE_METRICS_TABLE=performance_metrics
       - AI_MODEL_MIN_TRAINING_SAMPLES=30
     depends_on:
       - mqtt
@@ -163,6 +165,12 @@ services:
       - CASSANDRA_TABLE=air_quality
       - ALARM_STATE_TABLE=alarm_state
       - ALARM_EVENTS_TABLE=alarm_events
+      - FORECAST_TABLE=pm25_forecasts
+      - PERFORMANCE_METRICS_TABLE=performance_metrics
+      - FORECAST_WINDOW_SIZE=60
+      - FORECAST_HORIZONS_MINUTES=10,30,60
+      - FORECAST_MIN_SAMPLES=8
+      - FORECAST_MAX_DELTA=12.0
       - ALERT_SMTP_HOST=mailpit
       - ALERT_SMTP_PORT=1025
       - ALERT_EMAIL_FROM=alerts@airwatch-prishtina.com

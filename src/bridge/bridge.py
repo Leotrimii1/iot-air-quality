@@ -3,6 +3,7 @@ import paho.mqtt.client as mqtt
 from kafka import KafkaProducer
 import time
 import os
+from datetime import datetime, timezone
 
 # MQTT settings
 BROKER = os.getenv("MQTT_BROKER", "mqtt")
@@ -15,6 +16,12 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "air-quality")
 
 # Kafka Producer setup
 producer = None
+message_count = 0
+last_log_time = time.time()
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 def connect_kafka():
     global producer
@@ -22,7 +29,12 @@ def connect_kafka():
         try:
             producer = KafkaProducer(
                 bootstrap_servers=[KAFKA_BROKER],
-                value_serializer=lambda x: json.dumps(x).encode('utf-8')
+                value_serializer=lambda x: json.dumps(x, separators=(",", ":")).encode("utf-8"),
+                linger_ms=20,
+                batch_size=65536,
+                acks="all",
+                retries=3,
+                max_in_flight_requests_per_connection=5,
             )
             print(f"Connected to Kafka at {KAFKA_BROKER}")
             return True
@@ -35,18 +47,28 @@ def on_connect(client, userdata, flags, rc):
     client.subscribe(TOPIC)
 
 def on_message(client, userdata, msg):
+    global message_count
+    global last_log_time
+
     try:
         data = json.loads(msg.payload.decode())
-        print(f"Received from MQTT: {data}")
+        data["bridge_received_at"] = utc_now_iso()
         
         if producer:
-            future = producer.send(KAFKA_TOPIC, value=data)
-            metadata = future.get(timeout=10)
-            producer.flush()
-            print(
-                f"Kafka accepted message: topic={metadata.topic}, "
-                f"partition={metadata.partition}, offset={metadata.offset}"
-            )
+            data["kafka_sent_at"] = utc_now_iso()
+            producer.send(KAFKA_TOPIC, value=data)
+            message_count += 1
+
+            now = time.time()
+            if now - last_log_time >= 5:
+                producer.flush(timeout=2)
+                rate = message_count / max(now - last_log_time, 1)
+                print(
+                    f"Bridge forwarding rate: {rate:.1f} msg/sec "
+                    f"to Kafka topic={KAFKA_TOPIC}"
+                )
+                message_count = 0
+                last_log_time = now
     except Exception as e:
         print(f"Error bridging message: {e}")
 

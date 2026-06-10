@@ -1,6 +1,8 @@
 import atexit
 import logging
 import os
+import math
+import statistics
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 from cassandra.cluster import Cluster
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, lit, to_timestamp, when
+from pyspark.sql.functions import col, current_timestamp, from_json, lit, to_timestamp, when
 from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
 from sklearn.ensemble import IsolationForest
 from sklearn.pipeline import Pipeline
@@ -32,15 +34,31 @@ ALARM_EVENTS_TABLE = os.getenv("ALARM_EVENTS_TABLE", "alarm_events")
 ANOMALY_PROFILE_TABLE = os.getenv("ANOMALY_PROFILE_TABLE", "sensor_ai_profiles")
 ANOMALY_EVENTS_TABLE = os.getenv("ANOMALY_EVENTS_TABLE", "anomaly_events")
 TRAINING_SAMPLE_TABLE = os.getenv("TRAINING_SAMPLE_TABLE", "sensor_ai_samples")
+FORECAST_TABLE = os.getenv("FORECAST_TABLE", "pm25_forecasts")
+PERFORMANCE_METRICS_TABLE = os.getenv("PERFORMANCE_METRICS_TABLE", "performance_metrics")
 MODEL_WINDOW_SIZE = int(os.getenv("AI_MODEL_WINDOW_SIZE", "200"))
 MIN_TRAINING_SAMPLES = int(os.getenv("AI_MODEL_MIN_TRAINING_SAMPLES", "30"))
 MODEL_CONTAMINATION = float(os.getenv("AI_MODEL_CONTAMINATION", "0.08"))
 MODEL_RETRAIN_AFTER = int(os.getenv("AI_MODEL_RETRAIN_AFTER", "10"))
+FORECAST_WINDOW_SIZE = int(os.getenv("FORECAST_WINDOW_SIZE", "60"))
+FORECAST_HORIZON_MINUTES = int(os.getenv("FORECAST_HORIZON_MINUTES", "10"))
+FORECAST_HORIZONS_MINUTES = [
+    int(item.strip())
+    for item in os.getenv("FORECAST_HORIZONS_MINUTES", "10,30,60").split(",")
+    if item.strip()
+]
+FORECAST_MIN_SAMPLES = int(os.getenv("FORECAST_MIN_SAMPLES", "8"))
+FORECAST_MAX_DELTA = float(os.getenv("FORECAST_MAX_DELTA", "12.0"))
 
 DEFAULT_PM2_5_RANKS = {
     "Good": 15.0,
     "Moderate": 35.0,
     "Unhealthy": 55.0,
+}
+DEFAULT_PM1_RANKS = {
+    "Good": 10.0,
+    "Moderate": 20.0,
+    "Unhealthy": 35.0,
 }
 
 
@@ -120,10 +138,22 @@ def init_cassandra() -> CassandraContext:
                 CREATE TABLE IF NOT EXISTS {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} (
                     sensor_id text,
                     timestamp timestamp,
+                    message_id text,
                     pm1 double,
                     pm2_5 double,
+                    pm1_status text,
+                    pm2_5_status text,
                     status text,
                     location text,
+                    published_at timestamp,
+                    bridge_received_at timestamp,
+                    kafka_sent_at timestamp,
+                    processed_at timestamp,
+                    stored_at timestamp,
+                    latency_ms double,
+                    forecast_pm2_5_10m double,
+                    forecast_pm2_5_30m double,
+                    forecast_pm2_5_60m double,
                     anomaly_score double,
                     is_anomaly boolean,
                     anomaly_reason text,
@@ -134,6 +164,18 @@ def init_cassandra() -> CassandraContext:
 
             for alter_statement in [
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD location text",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD message_id text",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD pm1_status text",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD pm2_5_status text",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD published_at timestamp",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD bridge_received_at timestamp",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD kafka_sent_at timestamp",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD processed_at timestamp",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD stored_at timestamp",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD latency_ms double",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm2_5_10m double",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm2_5_30m double",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm2_5_60m double",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD anomaly_score double",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD is_anomaly boolean",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD anomaly_reason text",
@@ -254,6 +296,39 @@ def init_cassandra() -> CassandraContext:
                 """
             )
 
+            session.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {CASSANDRA_KEYSPACE}.{FORECAST_TABLE} (
+                    sensor_id text,
+                    forecast_time timestamp,
+                    created_at timestamp,
+                    horizon_minutes int,
+                    forecast_pm2_5 double,
+                    last_pm2_5 double,
+                    method text,
+                    location text,
+                    PRIMARY KEY ((sensor_id), forecast_time)
+                ) WITH CLUSTERING ORDER BY (forecast_time DESC)
+                """
+            )
+
+            session.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {CASSANDRA_KEYSPACE}.{PERFORMANCE_METRICS_TABLE} (
+                    metric_scope text,
+                    recorded_at timestamp,
+                    batch_id int,
+                    input_rows int,
+                    batch_duration_ms double,
+                    avg_latency_ms double,
+                    p95_latency_ms double,
+                    p99_latency_ms double,
+                    throughput_rows_per_sec double,
+                    PRIMARY KEY ((metric_scope), recorded_at)
+                ) WITH CLUSTERING ORDER BY (recorded_at DESC)
+                """
+            )
+
             for rank_order, (rank_name, max_value) in enumerate(
                 DEFAULT_PM2_5_RANKS.items(),
                 start=1,
@@ -263,6 +338,18 @@ def init_cassandra() -> CassandraContext:
                     INSERT INTO {CASSANDRA_KEYSPACE}.{QUALITY_RANKS_TABLE}
                     (pollutant, rank_order, rank_name, max_value)
                     VALUES ('PM2.5', {rank_order}, '{rank_name}', {max_value})
+                    """
+                )
+
+            for rank_order, (rank_name, max_value) in enumerate(
+                DEFAULT_PM1_RANKS.items(),
+                start=1,
+            ):
+                session.execute(
+                    f"""
+                    INSERT INTO {CASSANDRA_KEYSPACE}.{QUALITY_RANKS_TABLE}
+                    (pollutant, rank_order, rank_name, max_value)
+                    VALUES ('PM1', {rank_order}, '{rank_name}', {max_value})
                     """
                 )
 
@@ -281,7 +368,8 @@ def init_cassandra() -> CassandraContext:
                 f"Cassandra schema initialized. Tables: "
                 f"{CASSANDRA_TABLE}, {SENSOR_METADATA_TABLE}, {QUALITY_RANKS_TABLE}, "
                 f"{ALARM_STATE_TABLE}, {ALARM_EVENTS_TABLE}, "
-                f"{ANOMALY_PROFILE_TABLE}, {TRAINING_SAMPLE_TABLE}, {ANOMALY_EVENTS_TABLE}"
+                f"{ANOMALY_PROFILE_TABLE}, {TRAINING_SAMPLE_TABLE}, {ANOMALY_EVENTS_TABLE}, "
+                f"{FORECAST_TABLE}, {PERFORMANCE_METRICS_TABLE}"
             )
             print(f"Loaded PM2.5 quality ranks: {quality_ranks}")
             return CassandraContext(cluster, session, quality_ranks)
@@ -297,6 +385,9 @@ quality_ranks = cassandra_context.quality_ranks
 GOOD_MAX = float(quality_ranks["Good"])
 MODERATE_MAX = float(quality_ranks["Moderate"])
 UNHEALTHY_MAX = float(quality_ranks["Unhealthy"])
+PM1_GOOD_MAX = float(DEFAULT_PM1_RANKS["Good"])
+PM1_MODERATE_MAX = float(DEFAULT_PM1_RANKS["Moderate"])
+PM1_UNHEALTHY_MAX = float(DEFAULT_PM1_RANKS["Unhealthy"])
 
 spark = (
     SparkSession.builder.appName("AirQualityProcessor")
@@ -340,6 +431,9 @@ schema = StructType(
     [
         StructField("message_id", StringType(), True),
         StructField("timestamp", StringType(), False),
+        StructField("published_at", StringType(), True),
+        StructField("bridge_received_at", StringType(), True),
+        StructField("kafka_sent_at", StringType(), True),
         StructField("sensor", sensor_schema, True),
         StructField("measurements", measurements_schema, True),
         StructField("health", health_schema, True),
@@ -359,6 +453,10 @@ structured_df = (
     .select(from_json(col("value"), schema).alias("data"))
     .select("data.*")
     .withColumn("timestamp", to_timestamp(col("timestamp")))
+    .withColumn("published_at", to_timestamp(col("published_at")))
+    .withColumn("bridge_received_at", to_timestamp(col("bridge_received_at")))
+    .withColumn("kafka_sent_at", to_timestamp(col("kafka_sent_at")))
+    .withColumn("processed_at", current_timestamp())
     .withColumn("sensor_id", col("sensor").getField("id"))
     .withColumn("location", col("sensor").getField("location"))
     .withColumn("pm1", col("measurements").getField("pm1"))
@@ -381,19 +479,34 @@ structured_df = (
 
 measurements_df = (
     structured_df.withColumn(
-        "status",
+        "pm2_5_status",
         when(col("pm2_5") <= lit(GOOD_MAX), lit("Good"))
         .when(col("pm2_5") <= lit(MODERATE_MAX), lit("Moderate"))
         .when(col("pm2_5") <= lit(UNHEALTHY_MAX), lit("Unhealthy"))
         .otherwise(lit("Very Unhealthy")),
     )
+    .withColumn(
+        "pm1_status",
+        when(col("pm1") <= lit(PM1_GOOD_MAX), lit("Good"))
+        .when(col("pm1") <= lit(PM1_MODERATE_MAX), lit("Moderate"))
+        .when(col("pm1") <= lit(PM1_UNHEALTHY_MAX), lit("Unhealthy"))
+        .otherwise(lit("Very Unhealthy")),
+    )
+    .withColumn("status", col("pm2_5_status"))
     .select(
+        "message_id",
         "sensor_id",
         "timestamp",
+        "published_at",
+        "bridge_received_at",
+        "kafka_sent_at",
+        "processed_at",
         "pm1",
         "pm2_5",
         "relative_humidity",
         "temperature",
+        "pm1_status",
+        "pm2_5_status",
         "status",
         "location",
         col("sensor").getField("type").alias("sensor_type"),
@@ -448,8 +561,11 @@ _insert_anomaly_event = session.prepare(
 _insert_measurement = session.prepare(
     f"""
     INSERT INTO {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
-    (sensor_id, timestamp, pm1, pm2_5, status, location, anomaly_score, is_anomaly, anomaly_reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (sensor_id, timestamp, message_id, pm1, pm2_5, pm1_status, pm2_5_status, status, location,
+     published_at, bridge_received_at, kafka_sent_at, processed_at, stored_at, latency_ms,
+     forecast_pm2_5_10m, forecast_pm2_5_30m, forecast_pm2_5_60m,
+     anomaly_score, is_anomaly, anomaly_reason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 )
 _upsert_sensor_metadata = session.prepare(
@@ -457,6 +573,28 @@ _upsert_sensor_metadata = session.prepare(
     INSERT INTO {CASSANDRA_KEYSPACE}.{SENSOR_METADATA_TABLE}
     (sensor_id, sensor_type, firmware, location, latitude, longitude, unit, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+)
+_insert_forecast = session.prepare(
+    f"""
+    INSERT INTO {CASSANDRA_KEYSPACE}.{FORECAST_TABLE}
+    (sensor_id, forecast_time, created_at, horizon_minutes, forecast_pm2_5, last_pm2_5, method, location)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+)
+_select_recent_measurements_for_forecast = session.prepare(
+    f"""
+    SELECT timestamp, pm2_5
+    FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
+    WHERE sensor_id = ?
+    LIMIT {FORECAST_WINDOW_SIZE}
+    """
+)
+_insert_performance_metric = session.prepare(
+    f"""
+    INSERT INTO {CASSANDRA_KEYSPACE}.{PERFORMANCE_METRICS_TABLE}
+    (metric_scope, recorded_at, batch_id, input_rows, batch_duration_ms, avg_latency_ms, p95_latency_ms, p99_latency_ms, throughput_rows_per_sec)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 )
 
@@ -646,19 +784,88 @@ def score_with_model(sensor_id: str, row, profile: SensorAnomalyProfile) -> Dict
     }
 
 
-def process_measurement_batch(batch_df, batch_id: int) -> None:
-    rows = batch_df.collect()
-    if not rows:
-        return
+def percentile(values: List[float], percentile_value: float) -> Optional[float]:
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    index = min(
+        len(sorted_values) - 1,
+        max(0, math.ceil((percentile_value / 100) * len(sorted_values)) - 1),
+    )
+    return round(sorted_values[index], 2)
 
-    LOGGER.info("Processing %s sensor readings in batch %s", len(rows), batch_id)
+
+def milliseconds_between(start: Optional[datetime], end: Optional[datetime]) -> Optional[float]:
+    if start is None or end is None:
+        return None
+    if start.tzinfo is not None:
+        start = start.replace(tzinfo=None)
+    if end.tzinfo is not None:
+        end = end.replace(tzinfo=None)
+    return round((end - start).total_seconds() * 1000, 2)
+
+
+def forecast_pm25(
+    sensor_id: str,
+    current_timestamp: datetime,
+    current_pm2_5: float,
+    horizon_minutes: int,
+) -> Optional[float]:
+    rows = list(session.execute(_select_recent_measurements_for_forecast, [sensor_id]))
+    points = [
+        (row.timestamp, float(row.pm2_5))
+        for row in rows
+        if row.timestamp is not None and row.pm2_5 is not None
+    ]
+    points.append((current_timestamp, float(current_pm2_5)))
+    points = sorted(points, key=lambda item: item[0])[-FORECAST_WINDOW_SIZE:]
+
+    if len(points) < FORECAST_MIN_SAMPLES:
+        return None
+
+    y_values = [value for _, value in points]
+    midpoint = max(1, len(y_values) // 2)
+    earlier_median = statistics.median(y_values[:midpoint])
+    recent_median = statistics.median(y_values[midpoint:])
+    current_value = float(current_pm2_5)
+
+    smoothed_now = (0.55 * current_value) + (0.45 * recent_median)
+    trend_delta = recent_median - earlier_median
+    horizon_factor = max(1.0, horizon_minutes / 10)
+    max_delta = FORECAST_MAX_DELTA * math.sqrt(horizon_factor)
+    bounded_delta = max(-max_delta, min(max_delta, trend_delta * horizon_factor))
+    forecast_value = smoothed_now + bounded_delta
+
+    lower_bound = max(0.0, recent_median - max_delta)
+    upper_bound = min(250.0, recent_median + max_delta)
+    forecast_value = max(lower_bound, min(upper_bound, forecast_value))
+    return round(forecast_value, 2)
+
+
+def process_measurement_batch(batch_df, batch_id: int) -> None:
+    batch_started = time.perf_counter()
+    rows = batch_df.toLocalIterator()
+    latencies: List[float] = []
+    processed_count = 0
     for row in rows:
         try:
+            processed_count += 1
             sensor_id = row["sensor_id"]
             timestamp = row["timestamp"]
+            published_at = row["published_at"] or timestamp
+            processed_at = row["processed_at"] or datetime.utcnow()
+            stored_at = datetime.utcnow()
+            latency_ms = milliseconds_between(published_at, stored_at)
+            if latency_ms is not None:
+                latencies.append(latency_ms)
             upsert_sensor_metadata_if_changed(row)
             profile = load_profile(sensor_id)
             anomaly = score_with_model(sensor_id, row, profile)
+            pm25_forecasts = {
+                horizon: forecast_pm25(sensor_id, timestamp, row["pm2_5"], horizon)
+                for horizon in FORECAST_HORIZONS_MINUTES
+            }
+            pm25_forecast_10m = pm25_forecasts.get(10)
 
             if not anomaly["is_anomaly"]:
                 session.execute(
@@ -683,10 +890,22 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
                 [
                     sensor_id,
                     timestamp,
+                    row["message_id"],
                     row["pm1"],
                     row["pm2_5"],
+                    row["pm1_status"],
+                    row["pm2_5_status"],
                     row["status"],
                     row["location"],
+                    published_at,
+                    row["bridge_received_at"],
+                    row["kafka_sent_at"],
+                    processed_at,
+                    stored_at,
+                    latency_ms,
+                    pm25_forecasts.get(10),
+                    pm25_forecasts.get(30),
+                    pm25_forecasts.get(60),
                     anomaly["score"],
                     anomaly["is_anomaly"],
                     anomaly["reason"],
@@ -719,6 +938,26 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
                     anomaly["reason"],
                 )
 
+            for horizon_minutes, forecast_value in pm25_forecasts.items():
+                if forecast_value is None:
+                    continue
+                forecast_time = datetime.utcfromtimestamp(
+                    timestamp.timestamp() + (horizon_minutes * 60)
+                )
+                session.execute(
+                    _insert_forecast,
+                    [
+                        sensor_id,
+                        forecast_time,
+                        stored_at,
+                        horizon_minutes,
+                        forecast_value,
+                        row["pm2_5"],
+                        "robust_recent_median_trend",
+                        row["location"],
+                    ],
+                )
+
             notifier.handle_measurement(
                 sensor_id=sensor_id,
                 timestamp=timestamp,
@@ -732,6 +971,37 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
                 batch_id,
                 exc,
             )
+
+    if processed_count == 0:
+        return
+
+    batch_duration_ms = round((time.perf_counter() - batch_started) * 1000, 2)
+    throughput = round(processed_count / max(batch_duration_ms / 1000, 0.001), 2)
+    avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else None
+    session.execute(
+        _insert_performance_metric,
+        [
+            "spark_to_cassandra",
+            datetime.utcnow(),
+            int(batch_id),
+            processed_count,
+            batch_duration_ms,
+            avg_latency,
+            percentile(latencies, 95),
+            percentile(latencies, 99),
+            throughput,
+        ],
+    )
+    LOGGER.info(
+        "Batch %s metrics rows=%s duration_ms=%s throughput=%s avg_latency_ms=%s p95=%s p99=%s",
+        batch_id,
+        processed_count,
+        batch_duration_ms,
+        throughput,
+        avg_latency,
+        percentile(latencies, 95),
+        percentile(latencies, 99),
+    )
 
 
 load_sensor_metadata_cache()

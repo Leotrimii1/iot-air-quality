@@ -30,6 +30,8 @@ ALARM_EVENTS_TABLE = os.getenv("ALARM_EVENTS_TABLE", "alarm_events")
 ANOMALY_EVENTS_TABLE = os.getenv("ANOMALY_EVENTS_TABLE", "anomaly_events")
 ANOMALY_PROFILE_TABLE = os.getenv("ANOMALY_PROFILE_TABLE", "sensor_ai_profiles")
 TRAINING_SAMPLE_TABLE = os.getenv("TRAINING_SAMPLE_TABLE", "sensor_ai_samples")
+FORECAST_TABLE = os.getenv("FORECAST_TABLE", "pm25_forecasts")
+PERFORMANCE_METRICS_TABLE = os.getenv("PERFORMANCE_METRICS_TABLE", "performance_metrics")
 MIN_TRAINING_SAMPLES = int(os.getenv("AI_MODEL_MIN_TRAINING_SAMPLES", "30"))
 MODEL_WINDOW_SIZE = int(os.getenv("AI_MODEL_WINDOW_SIZE", "200"))
 SIMULATOR_PUBLISH_WORKERS = int(os.getenv("SIMULATOR_PUBLISH_WORKERS", "4"))
@@ -1267,9 +1269,14 @@ INDEX_HTML = """
           <p class="metric-note">ug/m3</p>
         </div>
         <div class="metric">
-          <p class="metric-label">Statusi</p>
+          <p class="metric-label">Status PM2.5</p>
           <p id="dbStatus" class="metric-value">-</p>
-          <p class="metric-note">nga matjet e fundit</p>
+          <p class="metric-note">nga PM2.5 i fundit</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Status PM1</p>
+          <p id="dbPm1Status" class="metric-value">-</p>
+          <p class="metric-note">nga PM1 i fundit</p>
         </div>
         <div class="metric">
           <p class="metric-label">Lokacioni</p>
@@ -1285,6 +1292,31 @@ INDEX_HTML = """
           <p class="metric-label">Anomali</p>
           <p id="dbAnomalyCount" class="metric-value">0</p>
           <p class="metric-note">nga monitori automatik</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">P95 latency</p>
+          <p id="dbP95Latency" class="metric-value">-</p>
+          <p class="metric-note">end-to-end ms</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">Throughput</p>
+          <p id="dbThroughput" class="metric-value">-</p>
+          <p class="metric-note">rreshta/sec</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">PM2.5 pas 10 min</p>
+          <p id="dbForecastPm25" class="metric-value">-</p>
+          <p class="metric-note">parashikim i stabilizuar</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">PM2.5 pas 30 min</p>
+          <p id="dbForecastPm25_30" class="metric-value">-</p>
+          <p class="metric-note">trend i afert</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">PM2.5 pas 60 min</p>
+          <p id="dbForecastPm25_60" class="metric-value">-</p>
+          <p class="metric-note">trend i zgjatur</p>
         </div>
       </div>
 
@@ -1325,8 +1357,12 @@ INDEX_HTML = """
               <strong id="detailPm25">-</strong>
             </div>
             <div class="detail-card">
-              <p>Status</p>
+              <p>Status PM2.5</p>
               <strong id="detailStatus">-</strong>
+            </div>
+            <div class="detail-card">
+              <p>Status PM1</p>
+              <strong id="detailPm1Status">-</strong>
             </div>
             <div class="detail-card">
               <p>Monitor</p>
@@ -1712,16 +1748,18 @@ INDEX_HTML = """
       document.getElementById("healthPm25").textContent = Number.isFinite(pm25) ? formatDecimal(pm25) : "-";
       document.getElementById("detailPm1").textContent = latest ? formatDecimal(latest.pm1) : "-";
       document.getElementById("detailPm25").textContent = Number.isFinite(pm25) ? formatDecimal(pm25) : "-";
-      document.getElementById("detailStatus").textContent = latest ? latest.status : "-";
+      document.getElementById("detailStatus").textContent = latest ? (latest.pm2_5_status || latest.status) : "-";
+      document.getElementById("detailPm1Status").textContent = latest ? (latest.pm1_status || "-") : "-";
       document.getElementById("detailAi").textContent =
         ai && ai.latest && ai.latest.is_anomaly ? "Anomaly" : (ai && ai.trained ? "Normal" : "Learning");
       document.getElementById("pmGaugeFill").style.width = `${percent}%`;
       document.getElementById("pmGaugeMarker").style.left = `${percent}%`;
       badge.className = "health-badge";
-      if (latest && statusChipClass(latest.status)) {
-        badge.classList.add(statusChipClass(latest.status));
+      const pm25Status = latest ? (latest.pm2_5_status || latest.status) : "";
+      if (latest && statusChipClass(pm25Status)) {
+        badge.classList.add(statusChipClass(pm25Status));
       }
-      badge.textContent = latest ? latest.status : "No data";
+      badge.textContent = latest ? pm25Status : "No data";
     }
 
     function renderAlerts(alerts, anomalies) {
@@ -1775,14 +1813,44 @@ INDEX_HTML = """
     function renderDashboard(data) {
       const latest = data.latest;
       const ai = data.ai_status || {};
+      const perf = data.performance_metric || {};
+      const forecasts = data.forecasts || {};
       showError(data.error || "");
       document.getElementById("dbActiveSensors").textContent = formatNumber(data.sensors.length);
       document.getElementById("dbLatestPm1").textContent = latest ? formatDecimal(latest.pm1) : "-";
       document.getElementById("dbLatestPm25").textContent = latest ? formatDecimal(latest.pm2_5) : "-";
-      document.getElementById("dbStatus").textContent = latest ? latest.status : "-";
+      document.getElementById("dbStatus").textContent = latest ? (latest.pm2_5_status || latest.status) : "-";
+      document.getElementById("dbPm1Status").textContent = latest ? (latest.pm1_status || "-") : "-";
       document.getElementById("dbLocation").textContent = latest ? latest.location : "-";
       document.getElementById("dbAlertCount").textContent = formatNumber((data.alerts || []).length);
       document.getElementById("dbAnomalyCount").textContent = formatNumber((data.anomalies || []).length);
+      document.getElementById("dbP95Latency").textContent =
+        perf.p95_latency_ms !== null && perf.p95_latency_ms !== undefined ? formatDecimal(perf.p95_latency_ms) : "-";
+      document.getElementById("dbThroughput").textContent =
+        perf.throughput_rows_per_sec !== null && perf.throughput_rows_per_sec !== undefined
+          ? formatNumber(perf.throughput_rows_per_sec)
+          : "-";
+      const forecast10 = forecasts["10"] || {};
+      const forecast30 = forecasts["30"] || {};
+      const forecast60 = forecasts["60"] || {};
+      document.getElementById("dbForecastPm25").textContent =
+        forecast10.forecast_pm2_5 !== null && forecast10.forecast_pm2_5 !== undefined
+          ? formatDecimal(forecast10.forecast_pm2_5)
+          : latest && latest.forecast_pm2_5_10m !== null && latest.forecast_pm2_5_10m !== undefined
+            ? formatDecimal(latest.forecast_pm2_5_10m)
+            : "Learning";
+      document.getElementById("dbForecastPm25_30").textContent =
+        forecast30.forecast_pm2_5 !== null && forecast30.forecast_pm2_5 !== undefined
+          ? formatDecimal(forecast30.forecast_pm2_5)
+          : latest && latest.forecast_pm2_5_30m !== null && latest.forecast_pm2_5_30m !== undefined
+            ? formatDecimal(latest.forecast_pm2_5_30m)
+            : "Learning";
+      document.getElementById("dbForecastPm25_60").textContent =
+        forecast60.forecast_pm2_5 !== null && forecast60.forecast_pm2_5 !== undefined
+          ? formatDecimal(forecast60.forecast_pm2_5)
+          : latest && latest.forecast_pm2_5_60m !== null && latest.forecast_pm2_5_60m !== undefined
+            ? formatDecimal(latest.forecast_pm2_5_60m)
+            : "Learning";
       document.getElementById("chartSensor").textContent = data.sensor_id;
       renderSensors(data.sensors);
       renderHealthGauge(latest, ai);
@@ -2040,6 +2108,7 @@ def generate_reading(sensor_number, now_epoch, scenario="normal", timestamp_iso=
     return {
         "message_id": f"{message_prefix}-{sensor_number:05d}" if message_prefix else str(uuid.uuid4()),
         "timestamp": timestamp_iso or datetime.now(timezone.utc).isoformat(),
+        "published_at": timestamp_iso or datetime.now(timezone.utc).isoformat(),
         "sensor": profile,
         "measurements": {
             "pm1": round(pm1, 3),
@@ -2412,6 +2481,7 @@ def generate_payload(sensor_number, now_epoch, scenario, timestamp_iso, message_
     return (
         f'{{"message_id":"{message_id}",'
         f'"timestamp":"{timestamp_iso}",'
+        f'"published_at":"{timestamp_iso}",'
         f'"sensor":{sensor_profile_json(sensor_number)},'
         f'"measurements":{{"pm1":{pm1:.3f},"pm2.5":{pm2_5:.3f},'
         f'"relative_humidity":{relative_humidity:.2f},'
@@ -2457,7 +2527,8 @@ def get_sensor_timeseries(sensor_id, limit=80):
     safe_limit = max(1, min(int(limit), 200))
     rows = execute_cassandra(
         f"""
-        SELECT sensor_id, timestamp, pm1, pm2_5, status, location, anomaly_score, is_anomaly, anomaly_reason
+        SELECT sensor_id, timestamp, pm1, pm2_5, pm1_status, pm2_5_status, status, location, anomaly_score, is_anomaly, anomaly_reason,
+               latency_ms, forecast_pm2_5_10m, forecast_pm2_5_30m, forecast_pm2_5_60m, processed_at, stored_at
         FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
         WHERE sensor_id = %s
         LIMIT {safe_limit}
@@ -2470,15 +2541,76 @@ def get_sensor_timeseries(sensor_id, limit=80):
             "timestamp": row_timestamp(row.timestamp),
             "pm1": row.pm1,
             "pm2_5": row.pm2_5,
+            "pm1_status": getattr(row, "pm1_status", None),
+            "pm2_5_status": getattr(row, "pm2_5_status", None),
             "status": row.status,
             "location": row.location,
             "anomaly_score": row.anomaly_score,
             "is_anomaly": row.is_anomaly,
             "anomaly_reason": row.anomaly_reason,
+            "latency_ms": getattr(row, "latency_ms", None),
+            "forecast_pm2_5_10m": getattr(row, "forecast_pm2_5_10m", None),
+            "forecast_pm2_5_30m": getattr(row, "forecast_pm2_5_30m", None),
+            "forecast_pm2_5_60m": getattr(row, "forecast_pm2_5_60m", None),
+            "processed_at": row_timestamp(getattr(row, "processed_at", None)),
+            "stored_at": row_timestamp(getattr(row, "stored_at", None)),
         }
         for row in rows
     ]
     return list(reversed(readings))
+
+
+def get_latest_performance_metric():
+    rows = execute_cassandra(
+        f"""
+        SELECT recorded_at, batch_id, input_rows, batch_duration_ms, avg_latency_ms, p95_latency_ms, p99_latency_ms, throughput_rows_per_sec
+        FROM {CASSANDRA_KEYSPACE}.{PERFORMANCE_METRICS_TABLE}
+        WHERE metric_scope = %s
+        LIMIT 1
+        """,
+        ("spark_to_cassandra",),
+    )
+    row = rows.one()
+    if row is None:
+        return None
+    return {
+        "recorded_at": row_timestamp(row.recorded_at),
+        "batch_id": row.batch_id,
+        "input_rows": row.input_rows,
+        "batch_duration_ms": row.batch_duration_ms,
+        "avg_latency_ms": row.avg_latency_ms,
+        "p95_latency_ms": row.p95_latency_ms,
+        "p99_latency_ms": row.p99_latency_ms,
+        "throughput_rows_per_sec": row.throughput_rows_per_sec,
+    }
+
+
+def get_latest_forecasts(sensor_id):
+    rows = execute_cassandra(
+        f"""
+        SELECT sensor_id, forecast_time, created_at, horizon_minutes, forecast_pm2_5, last_pm2_5, method, location
+        FROM {CASSANDRA_KEYSPACE}.{FORECAST_TABLE}
+        WHERE sensor_id = %s
+        LIMIT 30
+        """,
+        (sensor_id,),
+    )
+    forecasts = {}
+    for row in rows:
+        horizon = str(row.horizon_minutes)
+        if horizon in forecasts:
+            continue
+        forecasts[horizon] = {
+            "sensor_id": row.sensor_id,
+            "forecast_time": row_timestamp(row.forecast_time),
+            "created_at": row_timestamp(row.created_at),
+            "horizon_minutes": row.horizon_minutes,
+            "forecast_pm2_5": row.forecast_pm2_5,
+            "last_pm2_5": row.last_pm2_5,
+            "method": row.method,
+            "location": row.location,
+        }
+    return forecasts
 
 
 def get_alarm_events(limit=40):
@@ -2658,6 +2790,8 @@ def api_dashboard():
         ai_status = get_ai_status(sensor_id)
         alerts = get_alarm_events()
         anomalies = get_anomaly_events()
+        performance_metric = get_latest_performance_metric()
+        forecasts = get_latest_forecasts(sensor_id)
         return jsonify(
             {
                 "sensor_id": sensor_id,
@@ -2667,6 +2801,8 @@ def api_dashboard():
                 "ai_status": ai_status,
                 "alerts": alerts,
                 "anomalies": anomalies,
+                "performance_metric": performance_metric,
+                "forecasts": forecasts,
                 "error": None,
             }
         )
@@ -2680,6 +2816,8 @@ def api_dashboard():
                 "ai_status": None,
                 "alerts": [],
                 "anomalies": [],
+                "performance_metric": None,
+                "forecasts": {},
                 "error": f"Cassandra dashboard data unavailable: {exc}",
             }
         )
