@@ -44,7 +44,7 @@ FORECAST_WINDOW_SIZE = int(os.getenv("FORECAST_WINDOW_SIZE", "60"))
 FORECAST_HORIZON_MINUTES = int(os.getenv("FORECAST_HORIZON_MINUTES", "10"))
 FORECAST_HORIZONS_MINUTES = [
     int(item.strip())
-    for item in os.getenv("FORECAST_HORIZONS_MINUTES", "10,30,60").split(",")
+    for item in os.getenv("FORECAST_HORIZONS_MINUTES", "30,60").split(",")
     if item.strip()
 ]
 FORECAST_MIN_SAMPLES = int(os.getenv("FORECAST_MIN_SAMPLES", "8"))
@@ -154,6 +154,8 @@ def init_cassandra() -> CassandraContext:
                     forecast_pm2_5_10m double,
                     forecast_pm2_5_30m double,
                     forecast_pm2_5_60m double,
+                    forecast_pm1_30m double,
+                    forecast_pm1_60m double,
                     anomaly_score double,
                     is_anomaly boolean,
                     anomaly_reason text,
@@ -176,6 +178,8 @@ def init_cassandra() -> CassandraContext:
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm2_5_10m double",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm2_5_30m double",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm2_5_60m double",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm1_30m double",
+                f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD forecast_pm1_60m double",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD anomaly_score double",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD is_anomaly boolean",
                 f"ALTER TABLE {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE} ADD anomaly_reason text",
@@ -564,8 +568,9 @@ _insert_measurement = session.prepare(
     (sensor_id, timestamp, message_id, pm1, pm2_5, pm1_status, pm2_5_status, status, location,
      published_at, bridge_received_at, kafka_sent_at, processed_at, stored_at, latency_ms,
      forecast_pm2_5_10m, forecast_pm2_5_30m, forecast_pm2_5_60m,
+     forecast_pm1_30m, forecast_pm1_60m,
      anomaly_score, is_anomaly, anomaly_reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 )
 _upsert_sensor_metadata = session.prepare(
@@ -584,7 +589,7 @@ _insert_forecast = session.prepare(
 )
 _select_recent_measurements_for_forecast = session.prepare(
     f"""
-    SELECT timestamp, pm2_5
+    SELECT timestamp, pm1, pm2_5
     FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
     WHERE sensor_id = ?
     LIMIT {FORECAST_WINDOW_SIZE}
@@ -805,25 +810,38 @@ def milliseconds_between(start: Optional[datetime], end: Optional[datetime]) -> 
     return round((end - start).total_seconds() * 1000, 2)
 
 
-def forecast_pm25(
-    sensor_id: str,
+def load_recent_forecast_points(sensor_id: str) -> List[Dict[str, object]]:
+    rows = list(session.execute(_select_recent_measurements_for_forecast, [sensor_id]))
+    return [
+        {
+            "timestamp": row.timestamp,
+            "pm1": float(row.pm1) if row.pm1 is not None else None,
+            "pm2_5": float(row.pm2_5) if row.pm2_5 is not None else None,
+        }
+        for row in rows
+        if row.timestamp is not None
+    ]
+
+
+def robust_forecast(
+    points: List[Dict[str, object]],
+    pollutant_key: str,
     current_timestamp: datetime,
-    current_pm2_5: float,
+    current_value: float,
     horizon_minutes: int,
 ) -> Optional[float]:
-    rows = list(session.execute(_select_recent_measurements_for_forecast, [sensor_id]))
-    points = [
-        (row.timestamp, float(row.pm2_5))
-        for row in rows
-        if row.timestamp is not None and row.pm2_5 is not None
+    series = [
+        (point["timestamp"], float(point[pollutant_key]))
+        for point in points
+        if point.get(pollutant_key) is not None
     ]
-    points.append((current_timestamp, float(current_pm2_5)))
-    points = sorted(points, key=lambda item: item[0])[-FORECAST_WINDOW_SIZE:]
+    series.append((current_timestamp, float(current_value)))
+    series = sorted(series, key=lambda item: item[0])[-FORECAST_WINDOW_SIZE:]
 
-    if len(points) < FORECAST_MIN_SAMPLES:
+    if len(series) < FORECAST_MIN_SAMPLES:
         return None
 
-    y_values = [value for _, value in points]
+    y_values = [value for _, value in series]
     midpoint = max(1, len(y_values) // 2)
     earlier_median = statistics.median(y_values[:midpoint])
     recent_median = statistics.median(y_values[midpoint:])
@@ -861,11 +879,15 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
             upsert_sensor_metadata_if_changed(row)
             profile = load_profile(sensor_id)
             anomaly = score_with_model(sensor_id, row, profile)
+            forecast_points = load_recent_forecast_points(sensor_id)
             pm25_forecasts = {
-                horizon: forecast_pm25(sensor_id, timestamp, row["pm2_5"], horizon)
+                horizon: robust_forecast(forecast_points, "pm2_5", timestamp, row["pm2_5"], horizon)
                 for horizon in FORECAST_HORIZONS_MINUTES
             }
-            pm25_forecast_10m = pm25_forecasts.get(10)
+            pm1_forecasts = {
+                horizon: robust_forecast(forecast_points, "pm1", timestamp, row["pm1"], horizon)
+                for horizon in FORECAST_HORIZONS_MINUTES
+            }
 
             if not anomaly["is_anomaly"]:
                 session.execute(
@@ -903,9 +925,11 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
                     processed_at,
                     stored_at,
                     latency_ms,
-                    pm25_forecasts.get(10),
+                    None,
                     pm25_forecasts.get(30),
                     pm25_forecasts.get(60),
+                    pm1_forecasts.get(30),
+                    pm1_forecasts.get(60),
                     anomaly["score"],
                     anomaly["is_anomaly"],
                     anomaly["reason"],
@@ -964,6 +988,9 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
                 pm2_5=row["pm2_5"],
                 status=row["status"],
                 location=row["location"],
+                pm1=row["pm1"],
+                pm1_status=row["pm1_status"],
+                pm2_5_status=row["pm2_5_status"],
             )
         except Exception as exc:
             LOGGER.warning(

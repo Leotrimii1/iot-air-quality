@@ -120,6 +120,8 @@ CREATE TABLE air_quality.air_quality (
     forecast_pm2_5_10m double,
     forecast_pm2_5_30m double,
     forecast_pm2_5_60m double,
+    forecast_pm1_30m double,
+    forecast_pm1_60m double,
     anomaly_score double,
     is_anomaly boolean,
     anomaly_reason text,
@@ -235,7 +237,7 @@ CREATE TABLE air_quality.performance_metrics (
 
 Rreshti kalon fillimisht ne motorin e zbulimit te anomalive, pastaj ruhet ne Cassandra bashke me `anomaly_score`, `is_anomaly`, `anomaly_reason`, latencen end-to-end dhe parashikimin e PM2.5. `Isolation Forest` trajnohet ne kohe reale nga mostra te pastra qe ruhen ne `sensor_ai_samples`, ndersa metadata e trajnimit ruhet ne `sensor_ai_profiles`.
 
-Email alerts dergohen kur statusi kalon pragun `ALERT_EMAIL_MIN_STATUS`. Default-i i projektit eshte `Unhealthy`, sepse `Moderate` prodhon shume njoftime dhe nuk eshte i pershtatshem per alarmim operativ. Duplicate shmangen me cooldown. Recovery email mund te dergohet kur statusi zbret nen pragun e alarmit. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
+Email alerts dergohen kur statusi i PM1 ose PM2.5 kalon pragun `ALERT_EMAIL_MIN_STATUS`. Default-i i projektit eshte `Unhealthy`, sepse `Moderate` prodhon shume njoftime dhe nuk eshte i pershtatshem per alarmim operativ. Duplicate shmangen me cooldown per secilin ndotes. Recovery email mund te dergohet kur statusi zbret nen pragun e alarmit. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
 
 Konfigurimi demo i email-it perdor adresa te brendshme te sistemit:
 
@@ -275,10 +277,10 @@ Procesi eshte:
 - Metadata e sensorit kontrollohet me memory cache dhe ruhet vetem kur eshte e re ose ka ndryshuar.
 - `Isolation Forest` trajnohet per secilin sensor nga mostra te pastra ne `sensor_ai_samples`.
 - Ne realtime, AI e vlereson rreshtin perpara se rreshti final te ruhet ne `air_quality`.
-- Sistemi llogarit forecast te PM2.5 per 10, 30 dhe 60 minutat e ardhshme me median/trend te stabilizuar nga dritarja e fundit e matjeve. Forecast-i shfaqet vetem pasi sensori ka mjaftueshem histori; deri atehere dashboard-i e paraqet si `Learning`.
+- Sistemi llogarit forecast per PM1 dhe PM2.5 per 30 dhe 60 minutat e ardhshme me median/trend te stabilizuar nga dritarja e fundit e matjeve. Forecast-i shfaqet vetem pasi sensori ka mjaftueshem histori; deri atehere dashboard-i e paraqet si `Learning`.
 - Gjendja e modelit ruhet ne `sensor_ai_profiles`, prandaj dashboard-i mund te tregoje nese modeli eshte ende duke mesuar apo eshte trajnuar.
 - Nese AI zbulon anomali, eventi ruhet ne `anomaly_events`.
-- Alarmet operative perdorin statusin e PM2.5 dhe ruhen ne `alarm_events`; email dergohet vetem nga `Unhealthy` e lart.
+- Alarmet operative perdorin statusin e PM1 dhe PM2.5 dhe ruhen ne `alarm_events`; email dergohet vetem nga `Unhealthy` e lart.
 
 Per nivel projekti/enterprise demo, ky kombinim eshte i mire: rregullat e PM2.5 jane te shpjegueshme, anomaly detection kap sjellje te pazakonta qe nuk duken vetem me prag statik, ndersa forecast-i jep sinjal paraprak per ndotjen e mundshme. Per nje sistem enterprise te plote do te shtoheshin edhe model versioning, monitorim i drift-it, alert topic ne Kafka per integrime te jashtme dhe ruajtje e metrikave te performances se modelit.
 
@@ -347,7 +349,7 @@ Interpretimi:
 - Nese `max_batch_duration_ms` afrohet ose kalon `interval_ms`, simulatori nuk po arrin ta mbaje ritmin.
 - Nese `published_messages` rritet, por `throughput_rows_per_sec` dhe dashboard-i mbesin prapa, ngushtica eshte pas simulatorit: bridge, Kafka, Spark ose Cassandra.
 - Nese `alarm-spike` krijon rreshta ne `anomaly_events` dhe `alarm_events`, atehere rruga e AI/anomalive dhe alarmimit po punon edhe nen ngarkese.
-- Dashboard-i shfaq `P95 latency`, `Throughput` dhe `PM2.5 pas 10 min` nga tabelat e perpunuara ne Cassandra.
+- Dashboard-i shfaq `P95 latency`, `Throughput`, `PM2.5 pas 30 min/1h` dhe `PM1 pas 30 min/1h` nga tabelat e perpunuara ne Cassandra.
 
 Monitorimi gjate testeve:
 

@@ -109,11 +109,19 @@ class AlarmNotifier:
             VALUES (?, ?, ?, ?, ?)
             """
         )
+        for alter_statement in [
+            f"ALTER TABLE {self.keyspace}.alarm_events ADD pm1 double",
+            f"ALTER TABLE {self.keyspace}.alarm_events ADD pollutant text",
+        ]:
+            try:
+                self.session.execute(alter_statement)
+            except Exception:
+                pass
         self._insert_event = self.session.prepare(
             f"""
             INSERT INTO {self.keyspace}.alarm_events
-            (sensor_id, event_time, notification_channel, event_type, status, pm2_5, location, message)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (sensor_id, event_time, notification_channel, event_type, status, pm2_5, location, message, pm1, pollutant)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         )
 
@@ -124,14 +132,55 @@ class AlarmNotifier:
         pm2_5: Optional[float],
         status: Optional[str],
         location: Optional[str],
+        pm1: Optional[float] = None,
+        pm1_status: Optional[str] = None,
+        pm2_5_status: Optional[str] = None,
     ) -> None:
-        if not sensor_id or status is None or pm2_5 is None:
+        if not sensor_id:
+            return
+
+        self._handle_pollutant(
+            sensor_id=sensor_id,
+            state_id=f"{sensor_id}:PM2.5",
+            timestamp=timestamp,
+            pollutant="PM2.5",
+            value=pm2_5,
+            status=pm2_5_status or status,
+            location=location,
+            pm1=pm1,
+            pm2_5=pm2_5,
+        )
+        self._handle_pollutant(
+            sensor_id=sensor_id,
+            state_id=f"{sensor_id}:PM1",
+            timestamp=timestamp,
+            pollutant="PM1",
+            value=pm1,
+            status=pm1_status,
+            location=location,
+            pm1=pm1,
+            pm2_5=pm2_5,
+        )
+
+    def _handle_pollutant(
+        self,
+        sensor_id: str,
+        state_id: str,
+        timestamp: Optional[datetime],
+        pollutant: str,
+        value: Optional[float],
+        status: Optional[str],
+        location: Optional[str],
+        pm1: Optional[float],
+        pm2_5: Optional[float],
+    ) -> None:
+        if status is None or value is None:
             return
 
         now = _coerce_utc(timestamp) or datetime.now(timezone.utc)
         current_rank = status_rank(status)
         current_location = location or "Unknown"
-        previous = self._load_state(sensor_id)
+        previous = self._load_state(state_id)
 
         if current_rank < self.email_threshold:
             if (
@@ -140,12 +189,15 @@ class AlarmNotifier:
                 and previous.last_status is not None
                 and status_rank(previous.last_status) >= self.email_threshold
             ):
-                subject = f"AirWatch Prishtina recovery: {current_location}"
+                subject = f"AirWatch Prishtina recovery: {pollutant} at {current_location}"
                 message = self._format_message(
                     sensor_id=sensor_id,
                     location=current_location,
+                    pollutant=pollutant,
+                    value=value,
                     status=status,
                     pm2_5=pm2_5,
+                    pm1=pm1,
                     timestamp=now,
                     event_type="recovery",
                 )
@@ -153,16 +205,18 @@ class AlarmNotifier:
                     self._record_event(
                         sensor_id=sensor_id,
                         event_time=now,
-                        channel="email",
+                        channel=f"email_{pollutant.lower().replace('.', '_')}",
                         event_type="recovery",
                         status=status,
                         pm2_5=pm2_5,
+                        pm1=pm1,
+                        pollutant=pollutant,
                         location=current_location,
                         message=message,
                     )
 
             self._save_state(
-                sensor_id=sensor_id,
+                sensor_id=state_id,
                 last_status=status,
                 last_email_sent_at=previous.last_email_sent_at if previous else None,
                 last_sms_sent_at=previous.last_sms_sent_at if previous else None,
@@ -188,12 +242,15 @@ class AlarmNotifier:
         )
 
         if should_send_email:
-            subject = f"AirWatch Prishtina alert: {status} at {current_location}"
+            subject = f"AirWatch Prishtina alert: {pollutant} {status} at {current_location}"
             message = self._format_message(
                 sensor_id=sensor_id,
                 location=current_location,
+                pollutant=pollutant,
+                value=value,
                 status=status,
                 pm2_5=pm2_5,
+                pm1=pm1,
                 timestamp=now,
                 event_type="alert",
             )
@@ -201,10 +258,12 @@ class AlarmNotifier:
                 self._record_event(
                     sensor_id=sensor_id,
                     event_time=now,
-                    channel="email",
+                    channel=f"email_{pollutant.lower().replace('.', '_')}",
                     event_type="alert",
                     status=status,
                     pm2_5=pm2_5,
+                    pm1=pm1,
+                    pollutant=pollutant,
                     location=current_location,
                     message=message,
                 )
@@ -213,6 +272,8 @@ class AlarmNotifier:
             sms_message = self._format_sms_message(
                 sensor_id=sensor_id,
                 location=current_location,
+                pollutant=pollutant,
+                value=value,
                 status=status,
                 pm2_5=pm2_5,
             )
@@ -220,16 +281,18 @@ class AlarmNotifier:
                 self._record_event(
                     sensor_id=sensor_id,
                     event_time=now,
-                    channel="sms",
+                    channel=f"sms_{pollutant.lower().replace('.', '_')}",
                     event_type="alert",
                     status=status,
                     pm2_5=pm2_5,
+                    pm1=pm1,
+                    pollutant=pollutant,
                     location=current_location,
                     message=sms_message,
                 )
 
         self._save_state(
-            sensor_id=sensor_id,
+            sensor_id=state_id,
             last_status=status,
             last_email_sent_at=now if should_send_email else (previous.last_email_sent_at if previous else None),
             last_sms_sent_at=now if should_send_sms else (previous.last_sms_sent_at if previous else None),
@@ -274,6 +337,8 @@ class AlarmNotifier:
         event_type: str,
         status: Optional[str],
         pm2_5: Optional[float],
+        pm1: Optional[float],
+        pollutant: Optional[str],
         location: Optional[str],
         message: str,
     ) -> None:
@@ -288,6 +353,8 @@ class AlarmNotifier:
                 pm2_5,
                 location or "Unknown",
                 message,
+                pm1,
+                pollutant,
             ],
         )
 
@@ -397,29 +464,44 @@ class AlarmNotifier:
         self,
         sensor_id: str,
         location: str,
+        pollutant: str,
+        value: float,
         status: str,
-        pm2_5: float,
+        pm2_5: Optional[float],
+        pm1: Optional[float],
         timestamp: datetime,
         event_type: str,
     ) -> str:
-        return (
-            f"AirWatch Prishtina {event_type} notice\n"
-            f"Monitoring area: {location}\n"
-            f"Sensor ID: {sensor_id}\n"
-            f"Air quality status: {status}\n"
-            f"PM2.5 reading: {pm2_5:.2f} ug/m3\n"
-            f"Checked at: {timestamp.isoformat()}\n"
-            f"Recommended action: review the dashboard and confirm whether the reading is temporary or persistent.\n"
+        lines = [
+            f"AirWatch Prishtina {event_type} notice",
+            f"Monitoring area: {location}",
+            f"Sensor ID: {sensor_id}",
+            f"Pollutant: {pollutant}",
+            f"Air quality status: {status}",
+            f"{pollutant} reading: {value:.2f} ug/m3",
+        ]
+        if pm1 is not None:
+            lines.append(f"PM1 latest: {pm1:.2f} ug/m3")
+        if pm2_5 is not None:
+            lines.append(f"PM2.5 latest: {pm2_5:.2f} ug/m3")
+        lines.extend(
+            [
+                f"Checked at: {timestamp.isoformat()}",
+                "Recommended action: review the dashboard and confirm whether the reading is temporary or persistent.",
+            ]
         )
+        return "\n".join(lines) + "\n"
 
     def _format_sms_message(
         self,
         sensor_id: str,
         location: str,
+        pollutant: str,
+        value: float,
         status: str,
-        pm2_5: float,
+        pm2_5: Optional[float],
     ) -> str:
         return (
-            f"AirWatch Prishtina alert: {status} at {location} "
-            f"(sensor {sensor_id}, PM2.5 {pm2_5:.2f})."
+            f"AirWatch Prishtina alert: {pollutant} {status} at {location} "
+            f"(sensor {sensor_id}, {pollutant} {value:.2f})."
         )

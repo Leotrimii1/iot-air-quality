@@ -1259,6 +1259,11 @@ INDEX_HTML = """
           <p class="metric-note">ne monitorim</p>
         </div>
         <div class="metric">
+          <p class="metric-label">Lokacioni</p>
+          <p id="dbLocation" class="metric-value">-</p>
+          <p class="metric-note">zona e monitoruar</p>
+        </div>
+        <div class="metric">
           <p class="metric-label">PM1 i fundit</p>
           <p id="dbLatestPm1" class="metric-value">0.0</p>
           <p class="metric-note">ug/m3</p>
@@ -1279,21 +1284,6 @@ INDEX_HTML = """
           <p class="metric-note">nga PM1 i fundit</p>
         </div>
         <div class="metric">
-          <p class="metric-label">Lokacioni</p>
-          <p id="dbLocation" class="metric-value">-</p>
-          <p class="metric-note">zona e monitoruar</p>
-        </div>
-        <div class="metric">
-          <p class="metric-label">Alarme</p>
-          <p id="dbAlertCount" class="metric-value">0</p>
-          <p class="metric-note">njoftime aktive</p>
-        </div>
-        <div class="metric">
-          <p class="metric-label">Anomali</p>
-          <p id="dbAnomalyCount" class="metric-value">0</p>
-          <p class="metric-note">nga monitori automatik</p>
-        </div>
-        <div class="metric">
           <p class="metric-label">P95 latency</p>
           <p id="dbP95Latency" class="metric-value">-</p>
           <p class="metric-note">end-to-end ms</p>
@@ -1304,19 +1294,20 @@ INDEX_HTML = """
           <p class="metric-note">rreshta/sec</p>
         </div>
         <div class="metric">
-          <p class="metric-label">PM2.5 pas 10 min</p>
-          <p id="dbForecastPm25" class="metric-value">-</p>
-          <p class="metric-note">parashikim i stabilizuar</p>
-        </div>
-        <div class="metric">
           <p class="metric-label">PM2.5 pas 30 min</p>
           <p id="dbForecastPm25_30" class="metric-value">-</p>
-          <p class="metric-note">trend i afert</p>
         </div>
         <div class="metric">
-          <p class="metric-label">PM2.5 pas 60 min</p>
+          <p class="metric-label">PM2.5 pas 1h</p>
           <p id="dbForecastPm25_60" class="metric-value">-</p>
-          <p class="metric-note">trend i zgjatur</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">PM1 pas 30 min</p>
+          <p id="dbForecastPm1_30" class="metric-value">-</p>
+        </div>
+        <div class="metric">
+          <p class="metric-label">PM1 pas 1h</p>
+          <p id="dbForecastPm1_60" class="metric-value">-</p>
         </div>
       </div>
 
@@ -1423,7 +1414,10 @@ INDEX_HTML = """
       <section class="panel alerts-panel">
         <div class="live-header">
           <h2 class="panel-title">Alarmet dhe Anomalite</h2>
-          <span id="alertTableCount" class="live-count">0 evente</span>
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span id="alertTableCount" class="live-count">0 evente</span>
+            <a class="external-link" href="http://localhost:8025" target="_blank" rel="noreferrer">Hap Mail</a>
+          </div>
         </div>
         <div class="table-scroll">
           <table class="sensor-table">
@@ -1770,9 +1764,10 @@ INDEX_HTML = """
           sensor_id: event.sensor_id,
           type: event.event_type || event.notification_channel || "alert",
           status: event.status || "-",
+          pollutant: event.pollutant || "",
           pm1: event.pm1,
           pm2_5: event.pm2_5,
-          message: event.message || "-",
+          message: event.pollutant ? `${event.pollutant} alert` : (event.message || "-"),
         })),
         ...(anomalies || []).map((event) => ({
           time: event.event_time,
@@ -1822,23 +1817,14 @@ INDEX_HTML = """
       document.getElementById("dbStatus").textContent = latest ? (latest.pm2_5_status || latest.status) : "-";
       document.getElementById("dbPm1Status").textContent = latest ? (latest.pm1_status || "-") : "-";
       document.getElementById("dbLocation").textContent = latest ? latest.location : "-";
-      document.getElementById("dbAlertCount").textContent = formatNumber((data.alerts || []).length);
-      document.getElementById("dbAnomalyCount").textContent = formatNumber((data.anomalies || []).length);
       document.getElementById("dbP95Latency").textContent =
         perf.p95_latency_ms !== null && perf.p95_latency_ms !== undefined ? formatDecimal(perf.p95_latency_ms) : "-";
       document.getElementById("dbThroughput").textContent =
         perf.throughput_rows_per_sec !== null && perf.throughput_rows_per_sec !== undefined
           ? formatNumber(perf.throughput_rows_per_sec)
           : "-";
-      const forecast10 = forecasts["10"] || {};
       const forecast30 = forecasts["30"] || {};
       const forecast60 = forecasts["60"] || {};
-      document.getElementById("dbForecastPm25").textContent =
-        forecast10.forecast_pm2_5 !== null && forecast10.forecast_pm2_5 !== undefined
-          ? formatDecimal(forecast10.forecast_pm2_5)
-          : latest && latest.forecast_pm2_5_10m !== null && latest.forecast_pm2_5_10m !== undefined
-            ? formatDecimal(latest.forecast_pm2_5_10m)
-            : "Learning";
       document.getElementById("dbForecastPm25_30").textContent =
         forecast30.forecast_pm2_5 !== null && forecast30.forecast_pm2_5 !== undefined
           ? formatDecimal(forecast30.forecast_pm2_5)
@@ -1851,6 +1837,14 @@ INDEX_HTML = """
           : latest && latest.forecast_pm2_5_60m !== null && latest.forecast_pm2_5_60m !== undefined
             ? formatDecimal(latest.forecast_pm2_5_60m)
             : "Learning";
+      document.getElementById("dbForecastPm1_30").textContent =
+        latest && latest.forecast_pm1_30m !== null && latest.forecast_pm1_30m !== undefined
+          ? formatDecimal(latest.forecast_pm1_30m)
+          : "Learning";
+      document.getElementById("dbForecastPm1_60").textContent =
+        latest && latest.forecast_pm1_60m !== null && latest.forecast_pm1_60m !== undefined
+          ? formatDecimal(latest.forecast_pm1_60m)
+          : "Learning";
       document.getElementById("chartSensor").textContent = data.sensor_id;
       renderSensors(data.sensors);
       renderHealthGauge(latest, ai);
@@ -2528,7 +2522,8 @@ def get_sensor_timeseries(sensor_id, limit=80):
     rows = execute_cassandra(
         f"""
         SELECT sensor_id, timestamp, pm1, pm2_5, pm1_status, pm2_5_status, status, location, anomaly_score, is_anomaly, anomaly_reason,
-               latency_ms, forecast_pm2_5_10m, forecast_pm2_5_30m, forecast_pm2_5_60m, processed_at, stored_at
+               latency_ms, forecast_pm2_5_10m, forecast_pm2_5_30m, forecast_pm2_5_60m,
+               forecast_pm1_30m, forecast_pm1_60m, processed_at, stored_at
         FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
         WHERE sensor_id = %s
         LIMIT {safe_limit}
@@ -2552,6 +2547,8 @@ def get_sensor_timeseries(sensor_id, limit=80):
             "forecast_pm2_5_10m": getattr(row, "forecast_pm2_5_10m", None),
             "forecast_pm2_5_30m": getattr(row, "forecast_pm2_5_30m", None),
             "forecast_pm2_5_60m": getattr(row, "forecast_pm2_5_60m", None),
+            "forecast_pm1_30m": getattr(row, "forecast_pm1_30m", None),
+            "forecast_pm1_60m": getattr(row, "forecast_pm1_60m", None),
             "processed_at": row_timestamp(getattr(row, "processed_at", None)),
             "stored_at": row_timestamp(getattr(row, "stored_at", None)),
         }
@@ -2617,7 +2614,7 @@ def get_alarm_events(limit=40):
     safe_limit = max(1, min(int(limit), 100))
     rows = execute_cassandra(
         f"""
-        SELECT sensor_id, event_time, notification_channel, event_type, status, pm2_5, location, message
+        SELECT sensor_id, event_time, notification_channel, event_type, status, pm2_5, pm1, pollutant, location, message
         FROM {CASSANDRA_KEYSPACE}.{ALARM_EVENTS_TABLE}
         LIMIT {safe_limit}
         """
@@ -2630,6 +2627,8 @@ def get_alarm_events(limit=40):
             "event_type": row.event_type,
             "status": row.status,
             "pm2_5": row.pm2_5,
+            "pm1": getattr(row, "pm1", None),
+            "pollutant": getattr(row, "pollutant", None),
             "location": row.location,
             "message": row.message,
         }
