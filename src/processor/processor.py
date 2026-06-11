@@ -2,19 +2,15 @@ import atexit
 import logging
 import os
 import time
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from cassandra.cluster import Cluster
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, lit, to_timestamp, when
 from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
-from sklearn.ensemble import IsolationForest
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
 from alerts import AlarmNotifier
+from anomaly_model import AnomalyModelManager
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -51,21 +47,6 @@ class CassandraContext:
         self.quality_ranks = quality_ranks
 
 
-@dataclass
-class SensorAnomalyProfile:
-    sample_count: int = 0
-    trained_on_samples: int = 0
-    last_trained_at: Optional[datetime] = None
-    last_scored_at: Optional[datetime] = None
-
-
-@dataclass
-class TrainedAnomalyModel:
-    pipeline: Pipeline
-    trained_on_samples: int
-    trained_at: datetime
-
-
 SensorMetadataKey = Tuple[
     Optional[str],
     Optional[str],
@@ -74,15 +55,6 @@ SensorMetadataKey = Tuple[
     Optional[float],
     Optional[str],
 ]
-
-
-def feature_vector(row) -> List[float]:
-    return [
-        float(row["pm1"] or 0.0),
-        float(row["pm2_5"] or 0.0),
-        float(row["relative_humidity"] or 0.0),
-        float(row["temperature"] or 0.0),
-    ]
 
 
 cassandra_context: Optional[CassandraContext] = None
@@ -405,53 +377,7 @@ measurements_df = (
 )
 
 notifier = AlarmNotifier(session=session, keyspace=CASSANDRA_KEYSPACE, logger=LOGGER)
-
-_model_cache: Dict[str, TrainedAnomalyModel] = {}
 _sensor_metadata_cache: Dict[str, SensorMetadataKey] = {}
-
-_select_anomaly_profile = session.prepare(
-    f"""
-    SELECT sensor_id, sample_count, trained_on_samples, last_trained_at, last_scored_at, updated_at
-    FROM {CASSANDRA_KEYSPACE}.{ANOMALY_PROFILE_TABLE}
-    WHERE sensor_id = ?
-    """
-)
-_upsert_anomaly_profile = session.prepare(
-    f"""
-    INSERT INTO {CASSANDRA_KEYSPACE}.{ANOMALY_PROFILE_TABLE}
-    (sensor_id, sample_count, trained_on_samples, last_trained_at, last_scored_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """
-)
-_select_training_samples = session.prepare(
-    f"""
-    SELECT pm1, pm2_5, relative_humidity, temperature
-    FROM {CASSANDRA_KEYSPACE}.{TRAINING_SAMPLE_TABLE}
-    WHERE sensor_id = ?
-    LIMIT {MODEL_WINDOW_SIZE}
-    """
-)
-_insert_training_sample = session.prepare(
-    f"""
-    INSERT INTO {CASSANDRA_KEYSPACE}.{TRAINING_SAMPLE_TABLE}
-    (sensor_id, timestamp, pm1, pm2_5, relative_humidity, temperature)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """
-)
-_insert_anomaly_event = session.prepare(
-    f"""
-    INSERT INTO {CASSANDRA_KEYSPACE}.{ANOMALY_EVENTS_TABLE}
-    (sensor_id, event_time, anomaly_score, is_anomaly, reason, pm1, pm2_5, relative_humidity, temperature, status, location)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-)
-_insert_measurement = session.prepare(
-    f"""
-    INSERT INTO {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
-    (sensor_id, timestamp, pm1, pm2_5, status, location, anomaly_score, is_anomaly, anomaly_reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-)
 _upsert_sensor_metadata = session.prepare(
     f"""
     INSERT INTO {CASSANDRA_KEYSPACE}.{SENSOR_METADATA_TABLE}
@@ -459,37 +385,6 @@ _upsert_sensor_metadata = session.prepare(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """
 )
-
-
-def build_profile(row) -> SensorAnomalyProfile:
-    profile = SensorAnomalyProfile(
-        sample_count=int(row.sample_count or 0),
-        trained_on_samples=int(row.trained_on_samples or 0),
-        last_trained_at=row.last_trained_at,
-        last_scored_at=row.last_scored_at,
-    )
-    return profile
-
-
-def load_profile(sensor_id: str) -> SensorAnomalyProfile:
-    row = session.execute(_select_anomaly_profile, [sensor_id]).one()
-    if row is None:
-        return SensorAnomalyProfile()
-    return build_profile(row)
-
-
-def persist_profile(sensor_id: str, profile: SensorAnomalyProfile, updated_at: datetime) -> None:
-    session.execute(
-        _upsert_anomaly_profile,
-        [
-            sensor_id,
-            profile.sample_count,
-            profile.trained_on_samples,
-            profile.last_trained_at,
-            profile.last_scored_at,
-            updated_at,
-        ],
-    )
 
 
 def sensor_metadata_key(row) -> SensorMetadataKey:
@@ -545,105 +440,19 @@ def load_sensor_metadata_cache() -> None:
     LOGGER.info("Loaded %s sensor metadata records into memory cache", len(_sensor_metadata_cache))
 
 
-def load_training_samples(sensor_id: str) -> List[List[float]]:
-    rows = session.execute(_select_training_samples, [sensor_id])
-    return [
-        [
-            float(row.pm1 or 0.0),
-            float(row.pm2_5 or 0.0),
-            float(row.relative_humidity or 0.0),
-            float(row.temperature or 0.0),
-        ]
-        for row in rows
-    ]
-
-
-def train_model(sensor_id: str, clean_sample_count: int) -> Optional[TrainedAnomalyModel]:
-    samples = load_training_samples(sensor_id)
-    if len(samples) < MIN_TRAINING_SAMPLES:
-        return None
-
-    pipeline = Pipeline(
-        steps=[
-            ("scaler", StandardScaler()),
-            (
-                "isolation_forest",
-                IsolationForest(
-                    n_estimators=100,
-                    contamination=MODEL_CONTAMINATION,
-                    random_state=42,
-                    n_jobs=1,
-                ),
-            ),
-        ]
-    )
-    pipeline.fit(samples)
-
-    trained = TrainedAnomalyModel(
-        pipeline=pipeline,
-        trained_on_samples=clean_sample_count,
-        trained_at=datetime.utcnow(),
-    )
-    _model_cache[sensor_id] = trained
-    LOGGER.info(
-        "Trained IsolationForest for %s on %s samples",
-        sensor_id,
-        trained.trained_on_samples,
-    )
-    return trained
-
-
-def get_trained_model(sensor_id: str, profile: SensorAnomalyProfile) -> Optional[TrainedAnomalyModel]:
-    cached = _model_cache.get(sensor_id)
-    if cached is not None:
-        if (
-            profile.trained_on_samples == cached.trained_on_samples
-            and profile.last_trained_at == cached.trained_at
-        ):
-            return cached
-        if profile.sample_count - cached.trained_on_samples < MODEL_RETRAIN_AFTER:
-            return cached
-
-    trained = train_model(sensor_id, profile.sample_count)
-    if trained is not None:
-        profile.trained_on_samples = trained.trained_on_samples
-        profile.last_trained_at = trained.trained_at
-    return trained
-
-
-def score_with_model(sensor_id: str, row, profile: SensorAnomalyProfile) -> Dict[str, object]:
-    model = get_trained_model(sensor_id, profile)
-    if model is None:
-        status = row["status"] or ""
-        pm2_5 = float(row["pm2_5"] or 0.0)
-        if status in {"Unhealthy", "Very Unhealthy"} or pm2_5 >= 70.0:
-            return {
-                "is_anomaly": True,
-                "score": 0.9,
-                "reason": "Warm-up guard: insufficient clean history for Isolation Forest",
-            }
-        return {
-            "is_anomaly": False,
-            "score": 0.0,
-            "reason": "Isolation Forest warming up",
-        }
-
-    features = [feature_vector(row)]
-    decision = float(model.pipeline.decision_function(features)[0])
-    prediction = int(model.pipeline.predict(features)[0])
-    anomaly_score = round(max(0.0, -decision), 4)
-    is_anomaly = prediction == -1
-    reason = (
-        f"Isolation Forest flagged anomaly (decision={decision:.4f}, "
-        f"trained_on={model.trained_on_samples})"
-        if is_anomaly
-        else f"Isolation Forest normal (decision={decision:.4f}, trained_on={model.trained_on_samples})"
-    )
-    return {
-        "is_anomaly": is_anomaly,
-        "score": anomaly_score,
-        "reason": reason,
-    }
+anomaly_model = AnomalyModelManager(
+    session=session,
+    keyspace=CASSANDRA_KEYSPACE,
+    profile_table=ANOMALY_PROFILE_TABLE,
+    training_sample_table=TRAINING_SAMPLE_TABLE,
+    anomaly_events_table=ANOMALY_EVENTS_TABLE,
+    measurement_table=CASSANDRA_TABLE,
+    model_window_size=MODEL_WINDOW_SIZE,
+    min_training_samples=MIN_TRAINING_SAMPLES,
+    model_contamination=MODEL_CONTAMINATION,
+    model_retrain_after=MODEL_RETRAIN_AFTER,
+    logger=LOGGER,
+)
 
 
 def process_measurement_batch(batch_df, batch_id: int) -> None:
@@ -657,59 +466,21 @@ def process_measurement_batch(batch_df, batch_id: int) -> None:
             sensor_id = row["sensor_id"]
             timestamp = row["timestamp"]
             upsert_sensor_metadata_if_changed(row)
-            profile = load_profile(sensor_id)
-            anomaly = score_with_model(sensor_id, row, profile)
+            profile = anomaly_model.load_profile(sensor_id)
+            anomaly = anomaly_model.score_with_model(sensor_id, row, profile)
 
             if not anomaly["is_anomaly"]:
-                session.execute(
-                    _insert_training_sample,
-                    [
-                        sensor_id,
-                        timestamp,
-                        row["pm1"],
-                        row["pm2_5"],
-                        row["relative_humidity"],
-                        row["temperature"],
-                    ],
-                )
+                anomaly_model.insert_training_sample(row)
                 profile.sample_count += 1
 
             profile.last_scored_at = timestamp
 
-            persist_profile(sensor_id, profile, timestamp)
+            anomaly_model.persist_profile(sensor_id, profile, timestamp)
 
-            session.execute(
-                _insert_measurement,
-                [
-                    sensor_id,
-                    timestamp,
-                    row["pm1"],
-                    row["pm2_5"],
-                    row["status"],
-                    row["location"],
-                    anomaly["score"],
-                    anomaly["is_anomaly"],
-                    anomaly["reason"],
-                ],
-            )
+            anomaly_model.insert_measurement(row, anomaly)
 
             if anomaly["is_anomaly"]:
-                session.execute(
-                    _insert_anomaly_event,
-                    [
-                        sensor_id,
-                        timestamp,
-                        anomaly["score"],
-                        anomaly["is_anomaly"],
-                        anomaly["reason"],
-                        row["pm1"],
-                        row["pm2_5"],
-                        row["relative_humidity"],
-                        row["temperature"],
-                        row["status"],
-                        row["location"],
-                    ],
-                )
+                anomaly_model.insert_anomaly_event(row, anomaly)
 
                 LOGGER.info(
                     "Anomaly detected for %s at %s score=%s reason=%s",
