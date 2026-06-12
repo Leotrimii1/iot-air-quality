@@ -117,11 +117,6 @@ CREATE TABLE air_quality.air_quality (
     processed_at timestamp,
     stored_at timestamp,
     latency_ms double,
-    forecast_pm2_5_10m double,
-    forecast_pm2_5_30m double,
-    forecast_pm2_5_60m double,
-    forecast_pm1_30m double,
-    forecast_pm1_60m double,
     anomaly_score double,
     is_anomaly boolean,
     anomaly_reason text,
@@ -148,7 +143,7 @@ CREATE TABLE air_quality.quality_ranks (
 ) WITH CLUSTERING ORDER BY (rank_order ASC);
 ```
 
-Tabela `air_quality` ruan vetem te dhenat e nevojshme per rezultatet operative: `sensor_id`, `timestamp`, `pm1`, `pm2_5`, statuset per PM1/PM2.5, `location`, latencen, forecast-et dhe fushat e AI-se. Payload-i i plote i sensorit nuk ruhet si raw JSON, sepse `battery`, `signal` dhe fusha te tjera perdoren vetem per transport/simulim dhe nuk jane te nevojshme per query kryesore.
+Tabela `air_quality` ruan vetem te dhenat e nevojshme per rezultatet operative: `sensor_id`, `timestamp`, `pm1`, `pm2_5`, statuset per PM1/PM2.5, `location`, latencen end-to-end dhe fushat e AI-se per anomaly detection. Payload-i i plote i sensorit nuk ruhet si raw JSON, sepse `battery`, `signal` dhe fusha te tjera perdoren vetem per transport/simulim dhe nuk jane te nevojshme per query kryesore.
 
 Metadata e sensorit ruhet ndaras ne `sensor_metadata`: tipi, firmware, lokacioni, koordinatat dhe njesia matese. Procesori i mban keto metadata edhe ne memory cache dhe i shkruan ne Cassandra vetem kur sensori eshte i ri ose metadata ka ndryshuar. Pragjet e klasifikimit ruhen ne `quality_ranks` dhe lexohen kur starton Spark Streaming.
 
@@ -209,18 +204,6 @@ CREATE TABLE air_quality.sensor_ai_samples (
     PRIMARY KEY (sensor_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 
-CREATE TABLE air_quality.pm25_forecasts (
-    sensor_id text,
-    forecast_time timestamp,
-    created_at timestamp,
-    horizon_minutes int,
-    forecast_pm2_5 double,
-    last_pm2_5 double,
-    method text,
-    location text,
-    PRIMARY KEY ((sensor_id), forecast_time)
-) WITH CLUSTERING ORDER BY (forecast_time DESC);
-
 CREATE TABLE air_quality.performance_metrics (
     metric_scope text,
     recorded_at timestamp,
@@ -235,7 +218,7 @@ CREATE TABLE air_quality.performance_metrics (
 ) WITH CLUSTERING ORDER BY (recorded_at DESC);
 ```
 
-Rreshti kalon fillimisht ne motorin e zbulimit te anomalive, pastaj ruhet ne Cassandra bashke me `anomaly_score`, `is_anomaly`, `anomaly_reason`, latencen end-to-end dhe parashikimin e PM2.5. `Isolation Forest` trajnohet ne kohe reale nga mostra te pastra qe ruhen ne `sensor_ai_samples`, ndersa metadata e trajnimit ruhet ne `sensor_ai_profiles`.
+Rreshti kalon fillimisht ne motorin e zbulimit te anomalive, pastaj ruhet ne Cassandra bashke me `anomaly_score`, `is_anomaly`, `anomaly_reason` dhe latencen end-to-end. `Isolation Forest` trajnohet ne kohe reale nga mostra te pastra qe ruhen ne `sensor_ai_samples`, ndersa metadata e trajnimit ruhet ne `sensor_ai_profiles`.
 
 Email alerts dergohen kur statusi i PM1 ose PM2.5 kalon pragun `ALERT_EMAIL_MIN_STATUS`. Default-i i projektit eshte `Unhealthy`, sepse `Moderate` prodhon shume njoftime dhe nuk eshte i pershtatshem per alarmim operativ. Duplicate shmangen me cooldown per secilin ndotes. Recovery email mund te dergohet kur statusi zbret nen pragun e alarmit. SMS alerts jane opsionale dhe aktivizohen vetem kur vendosen `ALERT_SMS_PROVIDER=twilio` dhe kredencialet e Twilio.
 
@@ -277,12 +260,11 @@ Procesi eshte:
 - Metadata e sensorit kontrollohet me memory cache dhe ruhet vetem kur eshte e re ose ka ndryshuar.
 - `Isolation Forest` trajnohet per secilin sensor nga mostra te pastra ne `sensor_ai_samples`.
 - Ne realtime, AI e vlereson rreshtin perpara se rreshti final te ruhet ne `air_quality`.
-- Sistemi llogarit forecast per PM1 dhe PM2.5 per 30 dhe 60 minutat e ardhshme me median/trend te stabilizuar nga dritarja e fundit e matjeve. Forecast-i shfaqet vetem pasi sensori ka mjaftueshem histori; deri atehere dashboard-i e paraqet si `Learning`.
 - Gjendja e modelit ruhet ne `sensor_ai_profiles`, prandaj dashboard-i mund te tregoje nese modeli eshte ende duke mesuar apo eshte trajnuar.
 - Nese AI zbulon anomali, eventi ruhet ne `anomaly_events`.
 - Alarmet operative perdorin statusin e PM1 dhe PM2.5 dhe ruhen ne `alarm_events`; email dergohet vetem nga `Unhealthy` e lart.
 
-Per nivel projekti/enterprise demo, ky kombinim eshte i mire: rregullat e PM2.5 jane te shpjegueshme, anomaly detection kap sjellje te pazakonta qe nuk duken vetem me prag statik, ndersa forecast-i jep sinjal paraprak per ndotjen e mundshme. Per nje sistem enterprise te plote do te shtoheshin edhe model versioning, monitorim i drift-it, alert topic ne Kafka per integrime te jashtme dhe ruajtje e metrikave te performances se modelit.
+Per nivel projekti/enterprise demo, ky kombinim eshte i qarte dhe i mbrojtshem: rregullat e PM1/PM2.5 jane te shpjegueshme, ndersa anomaly detection kap sjellje te pazakonta qe nuk duken vetem me prag statik. Per nje sistem enterprise te plote do te shtoheshin edhe model versioning, monitorim i drift-it, alert topic ne Kafka per integrime te jashtme dhe ruajtje e metrikave te performances se modelit.
 
 ## Analiza e Performances dhe Optimizimit
 

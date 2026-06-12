@@ -128,7 +128,6 @@ services:
       - ANOMALY_EVENTS_TABLE=anomaly_events
       - ANOMALY_PROFILE_TABLE=sensor_ai_profiles
       - TRAINING_SAMPLE_TABLE=sensor_ai_samples
-      - FORECAST_TABLE=pm25_forecasts
       - PERFORMANCE_METRICS_TABLE=performance_metrics
       - AI_MODEL_MIN_TRAINING_SAMPLES=30
     depends_on:
@@ -156,21 +155,20 @@ services:
     build:
       context: .
       dockerfile: docker/processor/Dockerfile
+    ports:
+      - "4040:4040"
     environment:
       - PYTHONUNBUFFERED=1
       - KAFKA_BROKER=kafka:9092
       - KAFKA_TOPIC=air-quality
+      - KAFKA_STARTING_OFFSETS=latest
+      - SPARK_CHECKPOINT_DIR=/tmp/spark_checkpoint
       - CASSANDRA_HOST=cassandra
       - CASSANDRA_KEYSPACE=air_quality
       - CASSANDRA_TABLE=air_quality
       - ALARM_STATE_TABLE=alarm_state
       - ALARM_EVENTS_TABLE=alarm_events
-      - FORECAST_TABLE=pm25_forecasts
       - PERFORMANCE_METRICS_TABLE=performance_metrics
-      - FORECAST_WINDOW_SIZE=60
-      - FORECAST_HORIZONS_MINUTES=30,60
-      - FORECAST_MIN_SAMPLES=8
-      - FORECAST_MAX_DELTA=12.0
       - ALERT_SMTP_HOST=mailpit
       - ALERT_SMTP_PORT=1025
       - ALERT_EMAIL_FROM=alerts@airwatch-prishtina.com
@@ -180,6 +178,8 @@ services:
       - ALERT_SMS_TO=
       - ALERT_SMS_MIN_STATUS=Unhealthy
       - ALERT_SEND_RECOVERY_EMAIL=true
+    volumes:
+      - spark_checkpoints:/tmp/spark_checkpoint
     depends_on:
       cassandra:
         condition: service_healthy
@@ -200,6 +200,7 @@ volumes:
   cassandra_data:
   kafka_data:
   grafana_data:
+  spark_checkpoints:
 
 networks:
   iot_network:

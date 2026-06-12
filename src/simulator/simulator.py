@@ -30,7 +30,6 @@ ALARM_EVENTS_TABLE = os.getenv("ALARM_EVENTS_TABLE", "alarm_events")
 ANOMALY_EVENTS_TABLE = os.getenv("ANOMALY_EVENTS_TABLE", "anomaly_events")
 ANOMALY_PROFILE_TABLE = os.getenv("ANOMALY_PROFILE_TABLE", "sensor_ai_profiles")
 TRAINING_SAMPLE_TABLE = os.getenv("TRAINING_SAMPLE_TABLE", "sensor_ai_samples")
-FORECAST_TABLE = os.getenv("FORECAST_TABLE", "pm25_forecasts")
 PERFORMANCE_METRICS_TABLE = os.getenv("PERFORMANCE_METRICS_TABLE", "performance_metrics")
 MIN_TRAINING_SAMPLES = int(os.getenv("AI_MODEL_MIN_TRAINING_SAMPLES", "30"))
 MODEL_WINDOW_SIZE = int(os.getenv("AI_MODEL_WINDOW_SIZE", "200"))
@@ -1293,22 +1292,6 @@ INDEX_HTML = """
           <p id="dbThroughput" class="metric-value">-</p>
           <p class="metric-note">rreshta/sec</p>
         </div>
-        <div class="metric">
-          <p class="metric-label">PM2.5 pas 30 min</p>
-          <p id="dbForecastPm25_30" class="metric-value">-</p>
-        </div>
-        <div class="metric">
-          <p class="metric-label">PM2.5 pas 1h</p>
-          <p id="dbForecastPm25_60" class="metric-value">-</p>
-        </div>
-        <div class="metric">
-          <p class="metric-label">PM1 pas 30 min</p>
-          <p id="dbForecastPm1_30" class="metric-value">-</p>
-        </div>
-        <div class="metric">
-          <p class="metric-label">PM1 pas 1h</p>
-          <p id="dbForecastPm1_60" class="metric-value">-</p>
-        </div>
       </div>
 
       <div class="dashboard-layout">
@@ -1809,7 +1792,6 @@ INDEX_HTML = """
       const latest = data.latest;
       const ai = data.ai_status || {};
       const perf = data.performance_metric || {};
-      const forecasts = data.forecasts || {};
       showError(data.error || "");
       document.getElementById("dbActiveSensors").textContent = formatNumber(data.sensors.length);
       document.getElementById("dbLatestPm1").textContent = latest ? formatDecimal(latest.pm1) : "-";
@@ -1823,28 +1805,6 @@ INDEX_HTML = """
         perf.throughput_rows_per_sec !== null && perf.throughput_rows_per_sec !== undefined
           ? formatNumber(perf.throughput_rows_per_sec)
           : "-";
-      const forecast30 = forecasts["30"] || {};
-      const forecast60 = forecasts["60"] || {};
-      document.getElementById("dbForecastPm25_30").textContent =
-        forecast30.forecast_pm2_5 !== null && forecast30.forecast_pm2_5 !== undefined
-          ? formatDecimal(forecast30.forecast_pm2_5)
-          : latest && latest.forecast_pm2_5_30m !== null && latest.forecast_pm2_5_30m !== undefined
-            ? formatDecimal(latest.forecast_pm2_5_30m)
-            : "Learning";
-      document.getElementById("dbForecastPm25_60").textContent =
-        forecast60.forecast_pm2_5 !== null && forecast60.forecast_pm2_5 !== undefined
-          ? formatDecimal(forecast60.forecast_pm2_5)
-          : latest && latest.forecast_pm2_5_60m !== null && latest.forecast_pm2_5_60m !== undefined
-            ? formatDecimal(latest.forecast_pm2_5_60m)
-            : "Learning";
-      document.getElementById("dbForecastPm1_30").textContent =
-        latest && latest.forecast_pm1_30m !== null && latest.forecast_pm1_30m !== undefined
-          ? formatDecimal(latest.forecast_pm1_30m)
-          : "Learning";
-      document.getElementById("dbForecastPm1_60").textContent =
-        latest && latest.forecast_pm1_60m !== null && latest.forecast_pm1_60m !== undefined
-          ? formatDecimal(latest.forecast_pm1_60m)
-          : "Learning";
       document.getElementById("chartSensor").textContent = data.sensor_id;
       renderSensors(data.sensors);
       renderHealthGauge(latest, ai);
@@ -2522,8 +2482,7 @@ def get_sensor_timeseries(sensor_id, limit=80):
     rows = execute_cassandra(
         f"""
         SELECT sensor_id, timestamp, pm1, pm2_5, pm1_status, pm2_5_status, status, location, anomaly_score, is_anomaly, anomaly_reason,
-               latency_ms, forecast_pm2_5_10m, forecast_pm2_5_30m, forecast_pm2_5_60m,
-               forecast_pm1_30m, forecast_pm1_60m, processed_at, stored_at
+               latency_ms, processed_at, stored_at
         FROM {CASSANDRA_KEYSPACE}.{CASSANDRA_TABLE}
         WHERE sensor_id = %s
         LIMIT {safe_limit}
@@ -2544,11 +2503,6 @@ def get_sensor_timeseries(sensor_id, limit=80):
             "is_anomaly": row.is_anomaly,
             "anomaly_reason": row.anomaly_reason,
             "latency_ms": getattr(row, "latency_ms", None),
-            "forecast_pm2_5_10m": getattr(row, "forecast_pm2_5_10m", None),
-            "forecast_pm2_5_30m": getattr(row, "forecast_pm2_5_30m", None),
-            "forecast_pm2_5_60m": getattr(row, "forecast_pm2_5_60m", None),
-            "forecast_pm1_30m": getattr(row, "forecast_pm1_30m", None),
-            "forecast_pm1_60m": getattr(row, "forecast_pm1_60m", None),
             "processed_at": row_timestamp(getattr(row, "processed_at", None)),
             "stored_at": row_timestamp(getattr(row, "stored_at", None)),
         }
@@ -2560,7 +2514,9 @@ def get_sensor_timeseries(sensor_id, limit=80):
 def get_latest_performance_metric():
     rows = execute_cassandra(
         f"""
-        SELECT recorded_at, batch_id, input_rows, batch_duration_ms, avg_latency_ms, p95_latency_ms, p99_latency_ms, throughput_rows_per_sec
+        SELECT recorded_at, batch_id, input_rows, attempted_rows, success_rows, failed_rows,
+               batch_duration_ms, avg_latency_ms, p50_latency_ms, p95_latency_ms, p99_latency_ms,
+               throughput_rows_per_sec, error_rate
         FROM {CASSANDRA_KEYSPACE}.{PERFORMANCE_METRICS_TABLE}
         WHERE metric_scope = %s
         LIMIT 1
@@ -2574,40 +2530,17 @@ def get_latest_performance_metric():
         "recorded_at": row_timestamp(row.recorded_at),
         "batch_id": row.batch_id,
         "input_rows": row.input_rows,
+        "attempted_rows": getattr(row, "attempted_rows", None),
+        "success_rows": getattr(row, "success_rows", None),
+        "failed_rows": getattr(row, "failed_rows", None),
         "batch_duration_ms": row.batch_duration_ms,
         "avg_latency_ms": row.avg_latency_ms,
+        "p50_latency_ms": getattr(row, "p50_latency_ms", None),
         "p95_latency_ms": row.p95_latency_ms,
         "p99_latency_ms": row.p99_latency_ms,
         "throughput_rows_per_sec": row.throughput_rows_per_sec,
+        "error_rate": getattr(row, "error_rate", None),
     }
-
-
-def get_latest_forecasts(sensor_id):
-    rows = execute_cassandra(
-        f"""
-        SELECT sensor_id, forecast_time, created_at, horizon_minutes, forecast_pm2_5, last_pm2_5, method, location
-        FROM {CASSANDRA_KEYSPACE}.{FORECAST_TABLE}
-        WHERE sensor_id = %s
-        LIMIT 30
-        """,
-        (sensor_id,),
-    )
-    forecasts = {}
-    for row in rows:
-        horizon = str(row.horizon_minutes)
-        if horizon in forecasts:
-            continue
-        forecasts[horizon] = {
-            "sensor_id": row.sensor_id,
-            "forecast_time": row_timestamp(row.forecast_time),
-            "created_at": row_timestamp(row.created_at),
-            "horizon_minutes": row.horizon_minutes,
-            "forecast_pm2_5": row.forecast_pm2_5,
-            "last_pm2_5": row.last_pm2_5,
-            "method": row.method,
-            "location": row.location,
-        }
-    return forecasts
 
 
 def get_alarm_events(limit=40):
@@ -2790,7 +2723,6 @@ def api_dashboard():
         alerts = get_alarm_events()
         anomalies = get_anomaly_events()
         performance_metric = get_latest_performance_metric()
-        forecasts = get_latest_forecasts(sensor_id)
         return jsonify(
             {
                 "sensor_id": sensor_id,
@@ -2801,7 +2733,6 @@ def api_dashboard():
                 "alerts": alerts,
                 "anomalies": anomalies,
                 "performance_metric": performance_metric,
-                "forecasts": forecasts,
                 "error": None,
             }
         )
@@ -2816,7 +2747,6 @@ def api_dashboard():
                 "alerts": [],
                 "anomalies": [],
                 "performance_metric": None,
-                "forecasts": {},
                 "error": f"Cassandra dashboard data unavailable: {exc}",
             }
         )

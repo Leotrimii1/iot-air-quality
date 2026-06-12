@@ -1,7 +1,6 @@
 import argparse
 import csv
 import json
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -75,46 +74,8 @@ def request_json(path, method="GET", payload=None):
         return json.loads(response.read().decode("utf-8"))
 
 
-def docker_cql(query):
-    command = [
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "cassandra",
-        "cqlsh",
-        "-e",
-        query,
-    ]
-    try:
-        completed = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return completed.stdout
-    except Exception as exc:
-        return f"unavailable: {exc}"
-
-
-def extract_count(cql_output):
-    for line in cql_output.splitlines():
-        stripped = line.strip()
-        if stripped.isdigit():
-            return int(stripped)
-    return None
-
-
-def cassandra_count(table):
-    output = docker_cql(f"SELECT COUNT(*) FROM air_quality.{table};")
-    return extract_count(output)
-
-
 def run_scenario(name, config):
     print(f"Starting scenario '{name}': {config['description']}")
-    start_count = cassandra_count("air_quality")
 
     request_json(
         "/api/start",
@@ -146,7 +107,6 @@ def run_scenario(name, config):
     end_status = request_json("/api/status")
     request_json("/api/stop", method="POST", payload={})
     end_published = int(end_status.get("total_published") or 0)
-    end_count = cassandra_count("air_quality")
     duration = max(time.time() - started_at, 1)
     published_delta = max(end_published - start_published, 0)
     target_rate = float(end_status.get("target_rate") or 0)
@@ -158,11 +118,6 @@ def run_scenario(name, config):
     ]
     max_batch_ms = max(batch_durations) if batch_durations else 0.0
     avg_batch_ms = sum(batch_durations) / len(batch_durations) if batch_durations else 0.0
-    cassandra_delta = (
-        end_count - start_count
-        if isinstance(start_count, int) and isinstance(end_count, int)
-        else None
-    )
 
     result = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -174,7 +129,6 @@ def run_scenario(name, config):
         "target_rate_per_sec": round(target_rate, 2),
         "actual_publish_rate_per_sec": round(actual_rate, 2),
         "published_messages": published_delta,
-        "cassandra_rows_delta": cassandra_delta,
         "avg_batch_duration_ms": round(avg_batch_ms, 2),
         "max_batch_duration_ms": round(max_batch_ms, 2),
         "scenario": config["scenario"],
